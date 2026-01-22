@@ -26,6 +26,18 @@ pub struct RegisterMessage {
     pub prediction_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prediction_range_extra_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_connections: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub punch_overshoot: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_fallback: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_connections: Option<u32>,
+    #[serde(default)]
+    pub extra_ports: Vec<u16>,
 }
 
 impl RegisterMessage {
@@ -35,6 +47,12 @@ impl RegisterMessage {
         local_port: u16,
         prediction_mode: Option<String>,
         prediction_range_extra_pct: Option<f64>,
+        tcp_connections: Option<u32>,
+        scan_budget: Option<u32>,
+        punch_overshoot: Option<f64>,
+        allow_fallback: Option<bool>,
+        min_connections: Option<u32>,
+        extra_ports: Vec<u16>,
     ) -> Self {
         Self {
             msg_type: "register".to_string(),
@@ -44,6 +62,12 @@ impl RegisterMessage {
             private_ip: get_private_ip(),
             prediction_mode,
             prediction_range_extra_pct,
+            tcp_connections,
+            scan_budget,
+            punch_overshoot,
+            allow_fallback,
+            min_connections,
+            extra_ports,
         }
     }
 }
@@ -227,6 +251,25 @@ impl Default for ProbesCompleteMessage {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename = "add_ports")]
+pub struct AddPortsMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub session_id: String,
+    pub ports: Vec<u16>,
+}
+
+impl AddPortsMessage {
+    pub fn new(session_id: &str, ports: Vec<u16>) -> Self {
+        Self {
+            msg_type: "add_ports".to_string(),
+            session_id: session_id.to_string(),
+            ports,
+        }
+    }
+}
+
 impl From<PeerAddressInfo> for PeerAddress {
     fn from(info: PeerAddressInfo) -> Self {
         PeerAddress {
@@ -270,6 +313,23 @@ pub enum RelayMessage {
         same_network: bool,
         #[serde(default)]
         peer_nat_analysis: Option<NATAnalysis>,
+        #[serde(default)]
+        tcp_connections: Option<u32>,
+        #[serde(default)]
+        scan_budget: Option<u32>,
+        #[serde(default)]
+        punch_overshoot: Option<f64>,
+        #[serde(default)]
+        allow_fallback: Option<bool>,
+        #[serde(default)]
+        min_connections: Option<u32>,
+        #[serde(default)]
+        peer_extra_ports: Vec<u16>,
+    },
+
+    #[serde(rename = "peer_added_ports")]
+    PeerAddedPorts {
+        ports: Vec<u16>,
     },
     
     #[serde(rename = "go")]
@@ -319,6 +379,9 @@ pub mod transfer {
         Done = 5,        // Transfer complete
         Ack = 6,         // Final acknowledgment
         Error = 7,       // Error message (reserved for future use)
+        StreamInfo = 8,  // Multi-stream metadata
+        StreamInfoAck = 9, // Acknowledge stream info
+        ChunkAck = 10,   // Acknowledge chunk receipt
     }
 
     impl MessageType {
@@ -331,6 +394,9 @@ pub mod transfer {
                 5 => Some(Self::Done),
                 6 => Some(Self::Ack),
                 7 => Some(Self::Error),
+                8 => Some(Self::StreamInfo),
+                9 => Some(Self::StreamInfoAck),
+                10 => Some(Self::ChunkAck),
                 _ => None,
             }
         }
@@ -363,6 +429,59 @@ pub mod transfer {
             }
             let role = String::from_utf8(data[5..5 + len].to_vec()).ok()?;
             Some(Self { role })
+        }
+    }
+
+    /// Stream info message for multi-transfer
+    #[derive(Debug, Clone)]
+    pub struct StreamInfoMessage {
+        pub stream_index: u32,
+        pub total_streams: u32,
+    }
+
+    impl StreamInfoMessage {
+        /// Encode: type(1) + stream_index(4) + total_streams(4)
+        pub fn encode(&self) -> BytesMut {
+            let mut buf = BytesMut::with_capacity(9);
+            buf.put_u8(MessageType::StreamInfo as u8);
+            buf.put_u32(self.stream_index);
+            buf.put_u32(self.total_streams);
+            buf
+        }
+
+        pub fn decode(data: &[u8]) -> Option<Self> {
+            if data.len() < 9 {
+                return None;
+            }
+            let mut cursor = &data[1..];
+            let stream_index = cursor.get_u32();
+            let total_streams = cursor.get_u32();
+            Some(Self { stream_index, total_streams })
+        }
+    }
+
+    /// Chunk acknowledgment message
+    #[derive(Debug, Clone)]
+    pub struct ChunkAckMessage {
+        pub chunk_id: u32,
+    }
+
+    impl ChunkAckMessage {
+        /// Encode: type(1) + chunk_id(4)
+        pub fn encode(&self) -> BytesMut {
+            let mut buf = BytesMut::with_capacity(5);
+            buf.put_u8(MessageType::ChunkAck as u8);
+            buf.put_u32(self.chunk_id);
+            buf
+        }
+
+        pub fn decode(data: &[u8]) -> Option<Self> {
+            if data.len() < 5 {
+                return None;
+            }
+            let mut cursor = &data[1..];
+            let chunk_id = cursor.get_u32();
+            Some(Self { chunk_id })
         }
     }
 

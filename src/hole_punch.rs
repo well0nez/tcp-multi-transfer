@@ -18,6 +18,12 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
+#[cfg(windows)]
+#[allow(unused_imports)]
+use std::os::windows::io::FromRawSocket;
 use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 use anyhow::{Result, anyhow};
 use tracing::{info, debug, warn, error};
@@ -75,6 +81,29 @@ pub struct HolePunchConfig {
     /// Time offset: local_time + offset = server_time
     /// (positive = our clock is behind server, negative = ahead)
     pub time_offset: f64,
+}
+
+/// Configuration for multi-connection hole punching
+pub struct MultiHolePunchConfig {
+    /// Local sockets bound upfront (one per punch task)
+    pub local_sockets: Vec<Socket>,
+    /// Primary peer address (public IP:port)
+    pub peer_primary_addr: SocketAddr,
+    /// All peer addresses to try (including predicted ports)
+    pub peer_addresses: Vec<PeerAddress>,
+    /// Synchronized start time (Unix timestamp from SERVER)
+    pub start_at: f64,
+    /// How long to try after start_at before giving up
+    pub timeout: Duration,
+    /// Are we on the same network as peer?
+    #[allow(dead_code)]
+    pub same_network: bool,
+    /// Time offset: local_time + offset = server_time
+    pub time_offset: f64,
+    /// Desired number of successful connections
+    pub desired_connections: usize,
+    /// Global scan budget for unique peer ports (0 = unlimited)
+    pub scan_budget: usize,
 }
 
 impl Default for HolePunchConfig {
@@ -170,7 +199,7 @@ pub async fn do_hole_punch(config: HolePunchConfig) -> Result<HolePunchResult> {
     info!("Will try {} unique addresses", addresses.len());
     
     // Run the hole punch
-    let result = run_hole_punch(config.local_port, addresses, config.timeout).await;
+    let result = run_hole_punch(config.local_port, addresses, config.timeout, None).await;
     
     match &result {
         Ok(HolePunchResult::Success(_)) => {
@@ -187,16 +216,184 @@ pub async fn do_hole_punch(config: HolePunchConfig) -> Result<HolePunchResult> {
     result
 }
 
+/// Perform multiple hole punch attempts in parallel and return successful streams
+pub async fn do_multi_hole_punch(config: MultiHolePunchConfig) -> Result<Vec<TcpStream>> {
+    if config.local_sockets.is_empty() {
+        return Err(anyhow!("No local sockets provided for multi hole punch"));
+    }
+
+    let desired = config.desired_connections.min(config.local_sockets.len());
+    if desired == 0 {
+        return Err(anyhow!("desired_connections must be >= 1"));
+    }
+
+    // Wait until synchronized start time
+    let local_start_at = config.start_at - config.time_offset;
+    let now = current_timestamp();
+    let wait_time = local_start_at - now;
+
+    if config.time_offset.abs() > 0.1 {
+        info!("⏱️ Clock offset: {:.3}s (local {} server)", 
+            config.time_offset,
+            if config.time_offset > 0.0 { "behind" } else { "ahead of" });
+    }
+
+    if wait_time > 0.0 {
+        info!("Waiting {:.2}s until synchronized start time...", wait_time);
+        tokio::time::sleep(Duration::from_secs_f64(wait_time)).await;
+    } else if wait_time < -5.0 {
+        warn!("Start time was {:.2}s in the past! Clock sync issue?", -wait_time);
+    }
+
+    // Build unique address list
+    let mut addresses: Vec<SocketAddr> = vec![config.peer_primary_addr];
+    for pa in &config.peer_addresses {
+        if let Ok(addr) = pa.to_socket_addr() {
+            if !addresses.contains(&addr) {
+                addresses.push(addr);
+            }
+        }
+    }
+
+    if addresses.is_empty() {
+        return Err(anyhow!("No peer addresses available"));
+    }
+
+    if config.scan_budget > 0 && addresses.len() > config.scan_budget {
+        warn!(
+            "Scan budget capped: {} -> {} unique ports",
+            addresses.len(),
+            config.scan_budget
+        );
+        addresses.truncate(config.scan_budget);
+    }
+
+    info!(
+        "🚀 Starting multi-hole punch: tasks={}, desired={}, unique_ports={}",
+        config.local_sockets.len(),
+        desired,
+        addresses.len()
+    );
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(config.local_sockets.len().max(4));
+
+    let mut handles = Vec::new();
+    // Move ownership of sockets into tasks
+    for (_i, socket) in config.local_sockets.into_iter().enumerate() {
+        let tx = tx.clone();
+        let stop_rx = stop_rx.clone();
+        let timeout = config.timeout;
+        let task_addrs = addresses.clone();  // Hier: Alle Adressen an jede Task
+        
+        handles.push(tokio::spawn(async move {
+            if *stop_rx.borrow() {
+                return;
+            }
+            match run_hole_punch_with_socket(socket, task_addrs, timeout, Some(stop_rx)).await {
+                Ok(HolePunchResult::Success(stream)) => {
+                    let _ = tx.send(stream).await;
+                }
+                _ => {}
+            }
+        }));
+    }
+    drop(tx);
+
+    let deadline = Instant::now() + config.timeout + Duration::from_secs(1);
+    let mut successes: Vec<TcpStream> = Vec::with_capacity(desired);
+    let mut grace_period_deadline: Option<Instant> = None;
+
+    loop {
+        // If we have enough connections, set grace period if not set
+        if successes.len() >= desired && grace_period_deadline.is_none() {
+            info!("Target of {} connections reached. Waiting 1s grace period for overshoot...", desired);
+            grace_period_deadline = Some(Instant::now() + Duration::from_millis(1000));
+        }
+
+        let now = Instant::now();
+        
+        // Check deadlines
+        if let Some(gp) = grace_period_deadline {
+            if now >= gp {
+                info!("Grace period ended.");
+                break;
+            }
+        } else if now >= deadline {
+            break;
+        }
+
+        let remaining = if let Some(gp) = grace_period_deadline {
+            gp - now
+        } else {
+            deadline - now
+        };
+
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(stream)) => {
+                // Collect ALL successful streams, even overshoot
+                successes.push(stream);
+            }
+            _ => {
+                // Timeout or channel closed
+                break;
+            }
+        }
+    }
+
+    let _ = stop_tx.send(true);
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    // Sort by remote port so both sides have deterministic ordering
+    successes.sort_by_key(|s| s.peer_addr().map(|a| a.port()).unwrap_or(0));
+    
+    // Truncate to desired count - we collected extras during grace period
+    // to ensure both sides have overlapping sets, but we only need 'desired'
+    if successes.len() > desired {
+        info!("Collected {} connections, keeping first {} (sorted by remote port)", successes.len(), desired);
+        // Drop the extras explicitly to close connections cleanly
+        while successes.len() > desired {
+            let _ = successes.pop();
+        }
+    }
+
+    if successes.len() < desired {
+        warn!(
+            "Multi-hole punch got {}/{} connections",
+            successes.len(),
+            desired
+        );
+    } else {
+        info!("✅ Multi-hole punch established {} connections", successes.len());
+    }
+
+    Ok(successes)
+}
+
 /// Run the actual hole punch with listener and connector
-async fn run_hole_punch(
-    local_port: u16,
+// Helper to clone a socket (by duplicating fd)
+fn try_clone_socket(socket: &Socket) -> Result<Socket> {
+    socket.try_clone().map_err(|e| anyhow!("Failed to clone socket: {}", e))
+}
+
+async fn run_hole_punch_with_socket(
+    socket: Socket,
     peer_addresses: Vec<SocketAddr>,
     timeout: Duration,
+    stop_rx: Option<watch::Receiver<bool>>,
 ) -> Result<HolePunchResult> {
     
-    // Create and set up the listener socket
-    let listener_socket = create_hole_punch_socket()?;
-    bind_to_port(&listener_socket, local_port)?;
+    if let Some(rx) = &stop_rx {
+        if *rx.borrow() {
+            return Ok(HolePunchResult::Timeout);
+        }
+    }
+
+    // We need to clone the socket for the listener, while keeping one for connectors
+    let listener_socket = try_clone_socket(&socket)?;
     listener_socket.listen(128)?;
     
     let std_listener: std::net::TcpListener = listener_socket.into();
@@ -204,8 +401,7 @@ async fn run_hole_punch(
     let listener = TcpListener::from_std(std_listener)?;
     
     let actual_port = listener.local_addr()?.port();
-    let listener_local_port = actual_port;
-    info!("Listener ready on port {} (requested: {})", actual_port, local_port);
+    info!("Listener ready on port {} (reused)", actual_port);
     
     // Use a channel to communicate success
     let channel_capacity = peer_addresses.len().saturating_add(2).max(4);
@@ -213,9 +409,30 @@ async fn run_hole_punch(
     
     // Spawn listener task
     let listener_tx = tx.clone();
+    let mut stop_listener = stop_rx.clone();
     let listener_handle = tokio::spawn(async move {
         loop {
-            match listener.accept().await {
+            if let Some(rx) = &stop_listener {
+                if *rx.borrow() {
+                    break;
+                }
+            }
+
+            let accept_fut = listener.accept();
+
+            let accept_result = if let Some(rx) = stop_listener.as_mut() {
+                tokio::select! {
+                    _ = rx.changed() => {
+                        if *rx.borrow() { break; }
+                        continue;
+                    }
+                    res = accept_fut => res,
+                }
+            } else {
+                accept_fut.await
+            };
+
+            match accept_result {
                 Ok((mut stream, peer_addr)) => {
                     info!("Accepted connection from {}", peer_addr);
                     if let Err(_) = stream.set_nodelay(true) {
@@ -228,7 +445,7 @@ async fn run_hole_punch(
                     let stream_local_port = stream
                         .local_addr()
                         .map(|addr| addr.port())
-                        .unwrap_or(listener_local_port);
+                        .unwrap_or(actual_port);
                     let candidate = Candidate {
                         stream,
                         local_port: stream_local_port,
@@ -250,15 +467,33 @@ async fn run_hole_punch(
     let total_ports = peer_addresses.len();
     let connector_handles: Vec<_> = peer_addresses.iter().enumerate().map(|(idx, &peer_addr)| {
         let connector_tx = tx.clone();
-        let local_port = local_port;
         let port_num = idx + 1;
+        let mut stop_connector = stop_rx.clone();
+        // Clone socket for each connector attempt (wait, we need new socket from same port?)
+        // Actually for hole punching we need NEW socket bound to SAME port.
+        // We can't reuse the FD of the listener. We must bind NEW socket.
+        // But we passed 'socket' as an argument which is already bound?
+        // Yes. So we can query its local addr and bind new ones.
+        let local_addr_res = socket.local_addr();
         
         tokio::spawn(async move {
+            let local_addr = match local_addr_res {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let local_port = local_addr.as_socket().map(|s| s.port()).unwrap_or(0);
+
             let mut attempt = 0;
             let connector_timeout = timeout;
             let connector_start = Instant::now();
             
             while connector_start.elapsed() < connector_timeout {
+                if let Some(rx) = &stop_connector {
+                    if *rx.borrow() {
+                        break;
+                    }
+                }
+
                 attempt += 1;
                 
                 // Create a new socket for each attempt, bound to our local port
@@ -330,8 +565,310 @@ async fn run_hole_punch(
                         if is_in_progress {
                             // Wait for connection to complete
                             let std_stream: std::net::TcpStream = socket.into();
+
+                            let connect_res = if let Some(rx) = stop_connector.as_mut() {
+                                tokio::select! {
+                                    _ = rx.changed() => {
+                                        if *rx.borrow() { return; }
+                                        Err(anyhow!("cancelled"))
+                                    }
+                                    res = wait_for_connect(std_stream, Duration::from_millis(500)) => res,
+                                }
+                            } else {
+                                wait_for_connect(std_stream, Duration::from_millis(500)).await
+                            };
                             
-                            match wait_for_connect(std_stream, Duration::from_millis(500)).await {
+                            match connect_res {
+                                Ok(mut stream) => {
+                                    if let Err(e) = pre_handshake(&mut stream).await {
+                                        debug!("Pre-handshake failed to {}: {}", peer_addr, e);
+                                    } else {
+                                        let stream_local_port = stream
+                                            .local_addr()
+                                            .map(|addr| addr.port())
+                                            .unwrap_or(local_port);
+                                        let stream_remote_port = stream
+                                            .peer_addr()
+                                            .map(|addr| addr.port())
+                                            .unwrap_or(peer_addr.port());
+                                        info!("Connected to {} (port {}/{} found it!)", peer_addr, port_num, total_ports);
+                                        let candidate = Candidate {
+                                            stream,
+                                            local_port: stream_local_port,
+                                            remote_port: stream_remote_port,
+                                        };
+                                        let _ = connector_tx.send(candidate).await;
+                                        return;
+                                    }
+                                }
+                                Err(_) => {
+                                    // Connection failed, try again
+                                }
+                            }
+                        } else {
+                            // Real error
+                            if attempt % 20 == 0 {
+                                debug!("[{}] Connect attempt {} to {} failed: {}", 
+                                    idx, attempt, peer_addr, e);
+                            }
+                        }
+                    }
+                }
+                
+                // Small delay between attempts
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            
+            debug!("[{}] Connector to {} timed out after {} attempts", idx, peer_addr, attempt);
+        })
+    }).collect();
+    
+    // Drop our sender so the channel closes when all tasks are done
+    drop(tx);
+    
+    // Wait for success or timeout
+    let timeout_duration = timeout + Duration::from_secs(1);
+
+    let first = match tokio::time::timeout(timeout_duration, rx.recv()).await {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => {
+            listener_handle.abort();
+            for h in connector_handles {
+                h.abort();
+            }
+            return Ok(HolePunchResult::Timeout);
+        }
+        Err(_) => {
+            listener_handle.abort();
+            for h in connector_handles {
+                h.abort();
+            }
+            return Ok(HolePunchResult::Timeout);
+        }
+    };
+
+    let mut winner = first;
+    let mut winner_key = candidate_key(winner.local_port, winner.remote_port);
+    let grace_until = Instant::now() + GRACE_WINDOW;
+
+    loop {
+        let now = Instant::now();
+        if now >= grace_until {
+            break;
+        }
+        let remaining = grace_until - now;
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(candidate)) => {
+                let key = candidate_key(candidate.local_port, candidate.remote_port);
+                if key < winner_key {
+                    winner = candidate;
+                    winner_key = key;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    listener_handle.abort();
+    for h in connector_handles {
+        h.abort();
+    }
+
+    Ok(HolePunchResult::Success(winner.stream))
+}
+
+async fn run_hole_punch(
+    local_port: u16,
+    peer_addresses: Vec<SocketAddr>,
+    timeout: Duration,
+    stop_rx: Option<watch::Receiver<bool>>,
+) -> Result<HolePunchResult> {
+    
+    if let Some(rx) = &stop_rx {
+        if *rx.borrow() {
+            return Ok(HolePunchResult::Timeout);
+        }
+    }
+
+    // Create and set up the listener socket
+    let listener_socket = create_hole_punch_socket()?;
+    bind_to_port(&listener_socket, local_port)?;
+    listener_socket.listen(128)?;
+    
+    let std_listener: std::net::TcpListener = listener_socket.into();
+    std_listener.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(std_listener)?;
+    
+    let actual_port = listener.local_addr()?.port();
+    let listener_local_port = actual_port;
+    info!("Listener ready on port {} (requested: {})", actual_port, local_port);
+    
+    // Use a channel to communicate success
+    let channel_capacity = peer_addresses.len().saturating_add(2).max(4);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Candidate>(channel_capacity);
+    
+    // Spawn listener task
+    let listener_tx = tx.clone();
+    let mut stop_listener = stop_rx.clone();
+    let listener_handle = tokio::spawn(async move {
+        loop {
+            if let Some(rx) = &stop_listener {
+                if *rx.borrow() {
+                    break;
+                }
+            }
+
+            let accept_fut = listener.accept();
+
+            let accept_result = if let Some(rx) = stop_listener.as_mut() {
+                tokio::select! {
+                    _ = rx.changed() => {
+                        if *rx.borrow() { break; }
+                        continue;
+                    }
+                    res = accept_fut => res,
+                }
+            } else {
+                accept_fut.await
+            };
+
+            match accept_result {
+                Ok((mut stream, peer_addr)) => {
+                    info!("Accepted connection from {}", peer_addr);
+                    if let Err(_) = stream.set_nodelay(true) {
+                        warn!("Failed to set nodelay");
+                    }
+                    if let Err(e) = pre_handshake(&mut stream).await {
+                        debug!("Pre-handshake failed from {}: {}", peer_addr, e);
+                        continue;
+                    }
+                    let stream_local_port = stream
+                        .local_addr()
+                        .map(|addr| addr.port())
+                        .unwrap_or(listener_local_port);
+                    let candidate = Candidate {
+                        stream,
+                        local_port: stream_local_port,
+                        remote_port: peer_addr.port(),
+                    };
+                    if listener_tx.send(candidate).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!("Accept error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    });
+
+    // Spawn connector tasks for each address
+    let total_ports = peer_addresses.len();
+    let connector_handles: Vec<_> = peer_addresses.iter().enumerate().map(|(idx, &peer_addr)| {
+        let connector_tx = tx.clone();
+        let local_port = local_port;
+        let port_num = idx + 1;
+        let mut stop_connector = stop_rx.clone();
+        
+        tokio::spawn(async move {
+            let mut attempt = 0;
+            let connector_timeout = timeout;
+            let connector_start = Instant::now();
+            
+            while connector_start.elapsed() < connector_timeout {
+                if let Some(rx) = &stop_connector {
+                    if *rx.borrow() {
+                        break;
+                    }
+                }
+
+                attempt += 1;
+                
+                // Create a new socket for each attempt, bound to our local port
+                let socket = match create_hole_punch_socket() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!("Failed to create socket: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                
+                // CRITICAL: Bind to our local port!
+                if let Err(e) = bind_to_port(&socket, local_port) {
+                    debug!("Failed to bind to port {}: {}", local_port, e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                
+                // Set non-blocking for async operation
+                if let Err(e) = socket.set_nonblocking(true) {
+                    debug!("Failed to set nonblocking: {}", e);
+                    continue;
+                }
+                
+                // Try to connect
+                let connect_result = socket.connect(&SockAddr::from(peer_addr));
+                
+                match connect_result {
+                    Ok(()) => {
+                        // Immediate success (unlikely but possible)
+                        let std_stream: std::net::TcpStream = socket.into();
+                        match TcpStream::from_std(std_stream) {
+                            Ok(mut stream) => {
+                                if let Err(e) = pre_handshake(&mut stream).await {
+                                    debug!("Pre-handshake failed to {}: {}", peer_addr, e);
+                                } else {
+                                    let stream_local_port = stream
+                                        .local_addr()
+                                        .map(|addr| addr.port())
+                                        .unwrap_or(local_port);
+                                    let stream_remote_port = stream
+                                        .peer_addr()
+                                        .map(|addr| addr.port())
+                                        .unwrap_or(peer_addr.port());
+                                    info!("Connected to {} (port {}/{} found it!)", peer_addr, port_num, total_ports);
+                                    let candidate = Candidate {
+                                        stream,
+                                        local_port: stream_local_port,
+                                        remote_port: stream_remote_port,
+                                    };
+                                    let _ = connector_tx.send(candidate).await;
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to convert stream: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Check if it's "in progress" (expected for non-blocking)
+                        #[cfg(unix)]
+                        let is_in_progress = e.raw_os_error() == Some(libc::EINPROGRESS)
+                            || e.kind() == std::io::ErrorKind::WouldBlock;
+                        #[cfg(not(unix))]
+                        let is_in_progress = e.kind() == std::io::ErrorKind::WouldBlock;
+                        
+                        if is_in_progress {
+                            // Wait for connection to complete
+                            let std_stream: std::net::TcpStream = socket.into();
+
+                            let connect_res = if let Some(rx) = stop_connector.as_mut() {
+                                tokio::select! {
+                                    _ = rx.changed() => {
+                                        if *rx.borrow() { return; }
+                                        Err(anyhow!("cancelled"))
+                                    }
+                                    res = wait_for_connect(std_stream, Duration::from_millis(500)) => res,
+                                }
+                            } else {
+                                wait_for_connect(std_stream, Duration::from_millis(500)).await
+                            };
+                            
+                            match connect_res {
                                 Ok(mut stream) => {
                                     if let Err(e) = pre_handshake(&mut stream).await {
                                         debug!("Pre-handshake failed to {}: {}", peer_addr, e);

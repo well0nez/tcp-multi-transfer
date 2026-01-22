@@ -30,9 +30,9 @@ mod protocol;
 mod hole_punch;
 mod transfer;
 
-use protocol::{RegisterMessage, ReadyMessage, RelayMessage, ProbeMessage};
-use hole_punch::{HolePunchConfig, HolePunchResult, PeerAddress, do_hole_punch};
-use transfer::{TcpSender, TcpReceiver, calculate_sha256, set_chunk_size};
+use protocol::{RegisterMessage, ReadyMessage, RelayMessage, ProbeMessage, AddPortsMessage};
+use hole_punch::{HolePunchConfig, HolePunchResult, MultiHolePunchConfig, PeerAddress, do_hole_punch, do_multi_hole_punch};
+use transfer::{TcpSender, TcpReceiver, calculate_sha256, run_multi_receiver, run_multi_sender, set_chunk_size};
 
 /// Number of NAT probes to send
 const DEFAULT_NAT_PROBE_COUNT: u32 = 10;
@@ -104,9 +104,29 @@ struct Args {
     /// Enable debug logging
     #[arg(long)]
     debug: bool,
+
+    /// Number of parallel TCP connections (multi TCP)
+    #[arg(long, default_value_t = 1)]
+    tcp_connections: u32,
+
+    /// Global scan budget across all connections (0 = unlimited)
+    #[arg(long, default_value_t = 1024)]
+    scan_budget: u32,
+
+    /// Overshoot factor for hole punching (starts N*tcp_connections punches)
+    #[arg(long, default_value_t = 2.0)]
+    punch_overshoot: f64,
+
+    /// Allow fallback if fewer than desired connections are established
+    #[arg(long, default_value_t = false)]
+    allow_fallback: bool,
+
+    /// Minimum connections required when fallback is enabled
+    #[arg(long, default_value_t = 1)]
+    min_connections: u32,
     
-    /// Chunk size for transfer (e.g., 512KB, 1MB, 2MB)
-    #[arg(long, default_value = "1MB")]
+    /// Chunk size for transfer (e.g., 512KB, 1MB, 4MB)
+    #[arg(long, default_value = "4MB")]
     chunk: String,
 }
 
@@ -147,6 +167,14 @@ struct Session {
     our_delta: i32,
     /// Port preservation: true if our_delta == 0
     port_preserved: bool,
+    /// Multi-TCP parameters negotiated via relay
+    tcp_connections: u32,
+    scan_budget: u32,
+    punch_overshoot: f64,
+    allow_fallback: bool,
+    min_connections: u32,
+    bound_sockets: Vec<Socket>,
+    peer_extra_ports: Vec<u16>,
 }
 
 fn parse_host_port(input: &str) -> Result<(String, u16)> {
@@ -252,6 +280,26 @@ fn get_free_port() -> Result<u16> {
     Ok(port)
 }
 
+fn compute_punch_task_count(desired: usize, overshoot: f64) -> usize {
+    let overshoot = if overshoot < 1.0 { 1.0 } else { overshoot };
+    let count = (desired as f64 * overshoot).ceil() as usize;
+    count.max(desired).max(1)
+}
+
+fn build_local_ports(primary: u16, count: usize) -> Result<Vec<u16>> {
+    let mut ports = Vec::with_capacity(count);
+    let mut seen = HashSet::new();
+    seen.insert(primary);
+    ports.push(primary);
+    while ports.len() < count {
+        let p = get_free_port()?;
+        if seen.insert(p) {
+            ports.push(p);
+        }
+    }
+    Ok(ports)
+}
+
 /// Create a TCP socket bound to a specific local port
 fn create_bound_socket(local_port: u16) -> Result<Socket> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
@@ -281,13 +329,29 @@ async fn run_relay_protocol(
     probe_count: u32,
     prediction_mode: PredictionMode,
     prediction_range_extra_pct: f64,
+    tcp_connections: u32,
+    scan_budget: u32,
+    punch_overshoot: f64,
+    allow_fallback: bool,
+    min_connections: u32,
+    extra_ports: Vec<u16>,
+    bound_sockets: Vec<Socket>,
 ) -> Result<(TcpStream, Session)> {
-    info!("Connecting to relay server: {}", server_addr);
+    // We use the first bound socket for relay connection, but we need to keep the others alive!
+    // Actually run_relay_protocol connects to relay server. We should probably use the first socket for that.
+    // The existing code does `create_bound_socket(local_port)`. We should reuse one from bound_sockets.
     
-    // CRITICAL FIX: Connect FROM the local_port so NAT mapping matches hole punch!
+    info!("Connecting to relay server: {}", server_addr);
     let server_sock_addr = resolve_socket_addr(server_addr)?;
     
-    let socket = create_bound_socket(local_port)?;
+    // Use a SEPARATE socket for relay connection - don't consume bound_sockets!
+    // The bound_sockets are reserved for hole punching.
+    // Bind to port 0 (any free port) for the relay connection.
+    let socket = create_bound_socket(0).or_else(|_| {
+        // Fallback: use SO_REUSEADDR on local_port if binding to 0 fails
+        create_bound_socket(local_port)
+    })?;
+    
     socket.set_nonblocking(true)?;
     
     // Start async connect
@@ -316,6 +380,12 @@ async fn run_relay_protocol(
         local_port,
         Some(prediction_mode.as_str().to_string()),
         Some(prediction_range_extra_pct),
+        Some(tcp_connections),
+        Some(scan_budget),
+        Some(punch_overshoot),
+        Some(allow_fallback),
+        Some(min_connections),
+        extra_ports,
     );
     let msg = serde_json::to_string(&register)? + "\n";
     writer.write_all(msg.as_bytes()).await?;
@@ -338,6 +408,13 @@ async fn run_relay_protocol(
         our_public_port: None,
         our_delta: 0,
         port_preserved: true,
+        tcp_connections,
+        scan_budget,
+        punch_overshoot,
+        allow_fallback,
+        min_connections,
+        bound_sockets, // Store sockets in session to keep them alive
+        peer_extra_ports: vec![],
     };
     
     // Read messages from server until we get the GO signal
@@ -420,7 +497,7 @@ async fn run_relay_protocol(
                 }
             }
             
-            RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, your_role: _, same_network, peer_nat_analysis } => {
+            RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, your_role: _, same_network, peer_nat_analysis, tcp_connections, scan_budget, punch_overshoot, allow_fallback, min_connections, peer_extra_ports } => {
                 if let Some((ip, port)) = RelayMessage::parse_addr(&peer_public_addr) {
                     let addr: SocketAddr = format!("{}:{}", ip, port).parse()?;
                     session.peer_public_addr = Some(addr);
@@ -428,6 +505,18 @@ async fn run_relay_protocol(
                         .map(|pa| pa.into())
                         .collect();
                     session.same_network = same_network;
+                    session.tcp_connections = tcp_connections.unwrap_or(session.tcp_connections);
+                    session.scan_budget = scan_budget.unwrap_or(session.scan_budget);
+                    session.punch_overshoot = punch_overshoot.unwrap_or(session.punch_overshoot);
+                    session.allow_fallback = allow_fallback.unwrap_or(session.allow_fallback);
+                    session.min_connections = min_connections.unwrap_or(session.min_connections);
+                    session.peer_extra_ports = peer_extra_ports;
+                    if session.min_connections < 1 {
+                        session.min_connections = 1;
+                    }
+                    if session.min_connections > session.tcp_connections {
+                        session.min_connections = session.tcp_connections;
+                    }
                     
                     let addr_count = session.peer_addresses.len();
                     
@@ -444,13 +533,92 @@ async fn run_relay_protocol(
                         info!("  NAT: ✅ Port-Preserving (single address)");
                     }
                     
-                    // Send READY signal
-                    let ready = ReadyMessage::default();
-                    let msg = serde_json::to_string(&ready)? + "\n";
-                    writer.write_all(msg.as_bytes()).await?;
-                    writer.flush().await?;
-                    info!("✓ READY sent, waiting for GO...");
+                    // Send READY signal ONLY if we don't need to bind more ports first.
+                    // Actually, for Receiver, we check here if we have enough ports.
+                    
+                    let ready_to_send_ready = true;
+                    
+                    if session.our_public_port.is_some() {
+                        // Assuming receiver role if we are in this block and we know it?
+                        // We need to know our role here. But session doesn't store role explicitly.
+                        // Actually relay protocol was called with role.
+                        // We can capture 'role' from outer scope.
+                        let is_receiver = role == "receiver";
+                        
+                        if is_receiver {
+                            let desired = session.tcp_connections.max(1) as usize;
+                            let current_count = session.bound_sockets.len();
+                        
+                            // We need overshoot?
+                            let overshoot = session.punch_overshoot.max(1.0);
+                            let needed_count = compute_punch_task_count(desired, overshoot);
+                        
+                            if current_count < needed_count {
+                                let needed_more = needed_count - current_count;
+                                info!("Sender wants {} connections. Have {} sockets. Binding {} more...", desired, current_count, needed_more);
+                            
+                                // Bind more ports
+                                // We need to know the LAST bound port to increment from.
+                                // Or just take the last one from bound_sockets (local_addr)
+                            let next_port = if let Some(last) = session.bound_sockets.last() {
+                                    last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
+                                } else {
+                                    0 // Should not happen
+                                };
+                            
+                            if next_port > 0 {
+                                let mut new_ports = Vec::new();
+                                let mut added_count = 0;
+                                let mut attempt_counter = 0;
+                                let mut current_cand = next_port;
+                                
+                                while added_count < needed_more && attempt_counter < 100 {
+                                    match create_bound_socket(current_cand) {
+                                        Ok(s) => {
+                                            new_ports.push(current_cand);
+                                            session.bound_sockets.push(s);
+                                            added_count += 1;
+                                        },
+                                        Err(e) => {
+                                            debug!("Port {} busy or failed to bind: {}", current_cand, e);
+                                            // Just skip this port and try next, do NOT fallback to random
+                                        }
+                                    }
+                                    current_cand = current_cand.wrapping_add(1);
+                                    attempt_counter += 1;
+                                }
+                                
+                                if added_count < needed_more {
+                                    warn!("Could only bind {}/{} extra ports after {} attempts", added_count, needed_more, attempt_counter);
+                                }
+                                
+                                if !new_ports.is_empty() {
+                                    info!("Bound {} extra ports: {:?} (next free)", new_ports.len(), new_ports);
+                                    // Send AddPorts message
+                                    let add_msg = AddPortsMessage::new(&session_id, new_ports);
+                                    let json = serde_json::to_string(&add_msg)? + "\n";
+                                    writer.write_all(json.as_bytes()).await?;
+                                    writer.flush().await?;
+                                    info!("Sent AddPorts to server");
+                                }
+                            }
+                            }
+                        }
+                    
+                    if ready_to_send_ready {
+                        let ready = ReadyMessage::default();
+                        let msg = serde_json::to_string(&ready)? + "\n";
+                        writer.write_all(msg.as_bytes()).await?;
+                        writer.flush().await?;
+                        info!("✓ READY sent, waiting for GO...");
+                    }
+                    }
                 }
+            }
+            
+            RelayMessage::PeerAddedPorts { ports } => {
+                info!("Received {} additional ports from peer: {:?}", ports.len(), ports);
+                session.peer_extra_ports.extend(ports);
             }
             
             RelayMessage::Go { start_at, message } => {
@@ -495,6 +663,11 @@ async fn run_sender(
     probe_count: u32,
     prediction_mode: PredictionMode,
     prediction_range_extra_pct: f64,
+    tcp_connections: u32,
+    scan_budget: u32,
+    punch_overshoot: f64,
+    allow_fallback: bool,
+    min_connections: u32,
 ) -> Result<()> {
     // FIRST: Calculate SHA256 BEFORE connecting to relay
     // This can take a long time for large files, and we don't want to
@@ -505,9 +678,45 @@ async fn run_sender(
     info!("File size: {:.2} MB", file_size as f64 / (1024.0 * 1024.0));
     info!("");
     
-    // Get local port for hole punching
+    // Get local port for hole punching (primary registration port)
     let local_port = get_free_port()?;
     info!("Using local port: {}", local_port);
+
+    // Bind all needed ports upfront
+    let punch_tasks = compute_punch_task_count(tcp_connections.max(1) as usize, punch_overshoot);
+    let mut bound_sockets = Vec::new();
+    let mut extra_ports = Vec::new();
+    
+    // First socket is already implied by local_port? No, get_free_port drops socket.
+    // We should bind them properly now.
+    
+    // Attempt sequential binding starting from local_port
+    let mut current_port = local_port;
+    let mut added_count = 0;
+    let mut attempt_counter = 0;
+
+    while added_count < punch_tasks && attempt_counter < 100 {
+        match create_bound_socket(current_port) {
+            Ok(s) => {
+                bound_sockets.push(s);
+                extra_ports.push(current_port);
+                added_count += 1;
+            }
+            Err(e) => {
+                debug!("Port {} busy or failed to bind: {}", current_port, e);
+                // Skip busy port, try next
+            }
+        }
+        current_port = current_port.wrapping_add(1);
+        attempt_counter += 1;
+    }
+    
+    if added_count < punch_tasks {
+        warn!("Could only bind {}/{} ports after {} attempts", added_count, punch_tasks, attempt_counter);
+    }
+    
+    // Update local_port to be the first one bound
+    let local_port = *extra_ports.first().unwrap_or(&local_port);
     
     // Run relay protocol to get peer info and GO signal
     let (_relay_stream, session) = run_relay_protocol(
@@ -519,6 +728,13 @@ async fn run_sender(
         probe_count,
         prediction_mode,
         prediction_range_extra_pct,
+        tcp_connections,
+        scan_budget,
+        punch_overshoot,
+        allow_fallback,
+        min_connections,
+        extra_ports,
+        bound_sockets,
     ).await?;
     
     // We can close relay connection now - we have all the info we need
@@ -529,31 +745,122 @@ async fn run_sender(
     let start_at = session.start_at
         .ok_or_else(|| anyhow!("No start_at received"))?;
     
-    // Perform hole punch with clock offset compensation
-    let config = HolePunchConfig {
-        local_port,
-        peer_primary_addr: peer_addr,
-        peer_addresses: session.peer_addresses,
-        start_at,
-        timeout,
-        same_network: session.same_network,
-        time_offset: session.time_offset,
-    };
-    
-    let stream = match do_hole_punch(config).await? {
-        HolePunchResult::Success(stream) => stream,
-        HolePunchResult::Timeout => {
-            return Err(anyhow!("Hole punch timed out - could not establish connection"));
+    let desired_connections = session.tcp_connections.max(1) as usize;
+    let punch_tasks = compute_punch_task_count(desired_connections, session.punch_overshoot);
+    let local_ports = build_local_ports(local_port, punch_tasks)?;
+
+    let streams = if local_ports.len() == 1 {
+        // Single hole punch
+        let config = HolePunchConfig {
+            local_port,
+            peer_primary_addr: peer_addr,
+            peer_addresses: session.peer_addresses,
+            start_at,
+            timeout,
+            same_network: session.same_network,
+            time_offset: session.time_offset,
+        };
+
+        let stream = match do_hole_punch(config).await? {
+            HolePunchResult::Success(stream) => stream,
+            HolePunchResult::Timeout => {
+                return Err(anyhow!("Hole punch timed out - could not establish connection"));
+            }
+        };
+        vec![stream]
+    } else {
+        // Expand peer addresses if we have extra ports from peer (Explicit Exchange)
+        // If peer provided extra_ports, we use them directly.
+        // If not (e.g. legacy peer), we fall back to sequential expansion if needed.
+        let mut peer_addresses = session.peer_addresses.clone();
+        
+        if !session.peer_extra_ports.is_empty() {
+             // Explicit mode: Peer told us exactly which ports to use
+             // We construct PeerAddresses from them
+             if let Some(primary) = peer_addresses.first().cloned() {
+                 if let Ok(_) = primary.to_socket_addr() { // just to verify primary is valid
+                     info!("Using explicit peer ports: {:?}", session.peer_extra_ports);
+                     for p in &session.peer_extra_ports {
+                         // Skip primary if it's in extra_ports (it might be)
+                         if *p == peer_addr.port() { continue; }
+                         
+                         let new_addr = PeerAddress {
+                             ip: primary.ip.clone(),
+                             port: *p,
+                             addr_type: "explicit".to_string(),
+                         };
+                         // Ensure we don't duplicate
+                         let mut exists = false;
+                         for existing in &peer_addresses {
+                             if existing.port == *p { exists = true; break; }
+                         }
+                         if !exists {
+                             peer_addresses.push(new_addr);
+                         }
+                     }
+                 }
+             }
+        } else if desired_connections > peer_addresses.len() {
+            // Implicit mode (Legacy/Fallback)
+            if let Some(primary) = peer_addresses.first().cloned() {
+                if let Ok(base_addr) = primary.to_socket_addr() {
+                    let base_port = base_addr.port();
+                    let needed = desired_connections - peer_addresses.len();
+                    info!("Expanding peer list: generating {} sequential ports from base {}", needed, base_port);
+                    
+                    for i in 1..=needed {
+                        let new_port = base_port.wrapping_add(i as u16);
+                        let new_addr = PeerAddress {
+                            ip: primary.ip.clone(),
+                            port: new_port,
+                            addr_type: "expanded".to_string(),
+                        };
+                        peer_addresses.push(new_addr);
+                    }
+                }
+            }
         }
+
+        let config = MultiHolePunchConfig {
+            local_sockets: session.bound_sockets,
+            peer_primary_addr: peer_addr,
+            peer_addresses,
+            start_at,
+            timeout,
+            same_network: session.same_network,
+            time_offset: session.time_offset,
+            desired_connections,
+            scan_budget: session.scan_budget as usize,
+        };
+
+        let streams = do_multi_hole_punch(config).await?;
+        let min_required = if session.allow_fallback {
+            session.min_connections.max(1) as usize
+        } else {
+            desired_connections
+        };
+        if streams.len() < min_required {
+            return Err(anyhow!("Multi hole punch got {}/{} connections", streams.len(), desired_connections));
+        }
+        if session.allow_fallback && streams.len() < desired_connections {
+            warn!("Fallback enabled: proceeding with {} of {} connections", streams.len(), desired_connections);
+        }
+        streams
     };
-    
-    info!("✅ Direct P2P connection established!");
-    info!("   Local:  {}", stream.local_addr()?);
-    info!("   Remote: {}", stream.peer_addr()?);
-    
-    // Start file transfer with pre-calculated hash
-    let mut sender = TcpSender::new_with_hash(stream, file_path, file_size, sha256);
-    sender.run().await
+
+    for s in &streams {
+        info!("✅ Direct P2P connection established!");
+        info!("   Local:  {}", s.local_addr()?);
+        info!("   Remote: {}", s.peer_addr()?);
+    }
+
+    if desired_connections > 1 {
+        run_multi_sender(streams, file_path, file_size, sha256).await
+    } else {
+        let stream = streams.into_iter().next().unwrap();
+        let mut sender = TcpSender::new_with_hash(stream, file_path, file_size, sha256);
+        sender.run().await
+    }
 }
 
 /// Run the receiver
@@ -564,10 +871,47 @@ async fn run_receiver(
     probe_count: u32,
     prediction_mode: PredictionMode,
     prediction_range_extra_pct: f64,
+    tcp_connections: u32,
+    scan_budget: u32,
+    punch_overshoot: f64,
+    allow_fallback: bool,
+    min_connections: u32,
 ) -> Result<()> {
-    // Get local port for hole punching
+    // Get local port for hole punching (primary registration port)
     let local_port = get_free_port()?;
     info!("Using local port: {}", local_port);
+
+    // Bind all needed ports upfront
+    let punch_tasks = compute_punch_task_count(tcp_connections.max(1) as usize, punch_overshoot);
+    let mut bound_sockets = Vec::new();
+    let mut extra_ports = Vec::new();
+    
+    // Attempt sequential binding starting from local_port
+    let mut current_port = local_port;
+    let mut added_count = 0;
+    let mut attempt_counter = 0;
+
+    while added_count < punch_tasks && attempt_counter < 100 {
+        match create_bound_socket(current_port) {
+            Ok(s) => {
+                bound_sockets.push(s);
+                extra_ports.push(current_port);
+                added_count += 1;
+            }
+            Err(e) => {
+                debug!("Port {} busy or failed to bind: {}", current_port, e);
+                // Skip
+            }
+        }
+        current_port = current_port.wrapping_add(1);
+        attempt_counter += 1;
+    }
+    
+    if added_count < punch_tasks {
+        warn!("Could only bind {}/{} ports after {} attempts", added_count, punch_tasks, attempt_counter);
+    }
+    
+    let local_port = *extra_ports.first().unwrap_or(&local_port);
     
     // Run relay protocol to get peer info and GO signal
     let (_relay_stream, session) = run_relay_protocol(
@@ -579,6 +923,13 @@ async fn run_receiver(
         probe_count,
         prediction_mode,
         prediction_range_extra_pct,
+        tcp_connections,
+        scan_budget,
+        punch_overshoot,
+        allow_fallback,
+        min_connections,
+        extra_ports,
+        bound_sockets,
     ).await?;
     
     let peer_addr = session.peer_public_addr
@@ -586,31 +937,119 @@ async fn run_receiver(
     let start_at = session.start_at
         .ok_or_else(|| anyhow!("No start_at received"))?;
     
-    // Perform hole punch with clock offset compensation
-    let config = HolePunchConfig {
-        local_port,
-        peer_primary_addr: peer_addr,
-        peer_addresses: session.peer_addresses,
-        start_at,
-        timeout,
-        same_network: session.same_network,
-        time_offset: session.time_offset,
-    };
-    
-    let stream = match do_hole_punch(config).await? {
-        HolePunchResult::Success(stream) => stream,
-        HolePunchResult::Timeout => {
-            return Err(anyhow!("Hole punch timed out - could not establish connection"));
+    let desired_connections = session.tcp_connections.max(1) as usize;
+    let punch_tasks = compute_punch_task_count(desired_connections, session.punch_overshoot);
+    let local_ports = build_local_ports(local_port, punch_tasks)?;
+
+    let streams = if local_ports.len() == 1 {
+        let config = HolePunchConfig {
+            local_port,
+            peer_primary_addr: peer_addr,
+            peer_addresses: session.peer_addresses,
+            start_at,
+            timeout,
+            same_network: session.same_network,
+            time_offset: session.time_offset,
+        };
+
+        let stream = match do_hole_punch(config).await? {
+            HolePunchResult::Success(stream) => stream,
+            HolePunchResult::Timeout => {
+                return Err(anyhow!("Hole punch timed out - could not establish connection"));
+            }
+        };
+        vec![stream]
+    } else {
+        // Expand peer addresses if we have fewer candidates than desired connections
+        // This is crucial for Port-Preserving NATs where we only get 1 public port but want N connections.
+        // We assume sequential port allocation (Base, Base+1, ...)
+        let mut peer_addresses = session.peer_addresses.clone();
+        
+        if !session.peer_extra_ports.is_empty() {
+             // Explicit mode: Peer told us exactly which ports to use
+             if let Some(primary) = peer_addresses.first().cloned() {
+                 if let Ok(_) = primary.to_socket_addr() { // just to verify primary is valid
+                     info!("Using explicit peer ports: {:?}", session.peer_extra_ports);
+                     for p in &session.peer_extra_ports {
+                         // Skip primary if it's in extra_ports (it might be)
+                         if *p == peer_addr.port() { continue; }
+                         
+                         let new_addr = PeerAddress {
+                             ip: primary.ip.clone(),
+                             port: *p,
+                             addr_type: "explicit".to_string(),
+                         };
+                         // Ensure we don't duplicate
+                         let mut exists = false;
+                         for existing in &peer_addresses {
+                             if existing.port == *p { exists = true; break; }
+                         }
+                         if !exists {
+                             peer_addresses.push(new_addr);
+                         }
+                     }
+                 }
+             }
+        } else if desired_connections > peer_addresses.len() {
+            if let Some(primary) = peer_addresses.first().cloned() {
+                if let Ok(base_addr) = primary.to_socket_addr() {
+                    let base_port = base_addr.port();
+                    let needed = desired_connections - peer_addresses.len();
+                    info!("Expanding peer list: generating {} sequential ports from base {}", needed, base_port);
+                    
+                    for i in 1..=needed {
+                        let new_port = base_port.wrapping_add(i as u16);
+                        let new_addr = PeerAddress {
+                            ip: primary.ip.clone(),
+                            port: new_port,
+                            addr_type: "expanded".to_string(),
+                        };
+                        peer_addresses.push(new_addr);
+                    }
+                }
+            }
         }
+
+        let config = MultiHolePunchConfig {
+            local_sockets: session.bound_sockets,
+            peer_primary_addr: peer_addr,
+            peer_addresses,
+            start_at,
+            timeout,
+            same_network: session.same_network,
+            time_offset: session.time_offset,
+            desired_connections,
+            scan_budget: session.scan_budget as usize,
+        };
+
+        let streams = do_multi_hole_punch(config).await?;
+        let min_required = if session.allow_fallback {
+            session.min_connections.max(1) as usize
+        } else {
+            desired_connections
+        };
+        if streams.len() < min_required {
+            return Err(anyhow!("Multi hole punch got {}/{} connections", streams.len(), desired_connections));
+        }
+        if session.allow_fallback && streams.len() < desired_connections {
+            warn!("Fallback enabled: proceeding with {} of {} connections", streams.len(), desired_connections);
+        }
+        streams
     };
-    
-    info!("✅ Direct P2P connection established!");
-    info!("   Local:  {}", stream.local_addr()?);
-    info!("   Remote: {}", stream.peer_addr()?);
-    
-    // Start file transfer
-    let mut receiver = TcpReceiver::new(stream);
-    receiver.run().await
+
+    for s in &streams {
+        info!("✅ Direct P2P connection established!");
+        info!("   Local:  {}", s.local_addr()?);
+        info!("   Remote: {}", s.peer_addr()?);
+    }
+
+    if desired_connections > 1 {
+        run_multi_receiver(streams).await
+    } else {
+        let stream = streams.into_iter().next().unwrap();
+        let mut receiver = TcpReceiver::new(stream);
+        receiver.run().await
+    }
 }
 
 #[tokio::main]
@@ -641,6 +1080,19 @@ async fn main() -> Result<()> {
         return Err(anyhow!("Chunk size must be at most 16MB"));
     }
     set_chunk_size(chunk_size);
+
+    if args.tcp_connections < 1 {
+        return Err(anyhow!("--tcp-connections must be >= 1"));
+    }
+    if args.punch_overshoot < 1.0 {
+        return Err(anyhow!("--punch-overshoot must be >= 1.0"));
+    }
+    if args.min_connections < 1 {
+        return Err(anyhow!("--min-connections must be >= 1"));
+    }
+    if args.allow_fallback && args.min_connections > args.tcp_connections {
+        return Err(anyhow!("--min-connections must be <= --tcp-connections"));
+    }
     
     info!("TCP File Transfer Client v{} (ICE)", APP_VERSION);
     info!("===================================");
@@ -683,6 +1135,11 @@ async fn main() -> Result<()> {
                 args.probe_count,
                 args.prediction_mode,
                 args.prediction_range_extra_pct,
+                args.tcp_connections,
+                args.scan_budget,
+                args.punch_overshoot,
+                args.allow_fallback,
+                args.min_connections,
             ).await
         }
         Mode::Receive => {
@@ -697,6 +1154,11 @@ async fn main() -> Result<()> {
                 args.probe_count,
                 args.prediction_mode,
                 args.prediction_range_extra_pct,
+                args.tcp_connections,
+                args.scan_budget,
+                args.punch_overshoot,
+                args.allow_fallback,
+                args.min_connections,
             ).await
         }
     }

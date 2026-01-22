@@ -1,21 +1,25 @@
 //! TCP File Transfer Implementation - Optimized HIGH-THROUGHPUT
 //!
 //! Optimizations:
-//! - CHUNK_SIZE: 2MB (configurable via --chunk) - fewer syscalls
+//! - CHUNK_SIZE: 4MB (configurable via --chunk) - fewer syscalls
 //! - BUFFER_SIZE: 16MB for efficient I/O
 //! - TCP Socket buffers: 64MB send/recv (OS may cap lower)
-//! - Pipeline Depth: 16 chunks (~32MB in flight)
+//! - Pipeline Depth: 16 chunks (~64MB in flight at 4MB chunks)
 //! - Hybrid progress: every 10MB OR every 2 seconds
 //! - SHA256 only at the end (from disk) - TCP handles in-flight integrity
 //! - No checksum during transfer - TCP already guarantees delivery
 //! - Pipelined I/O - Disk reads and network writes run in parallel!
 
+use std::collections::VecDeque;
+use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
-use bytes::Buf;
+use tokio::sync::{Mutex, Notify};
+use bytes::{Buf, BufMut};
 use sha2::{Sha256, Digest};
 use indicatif::{ProgressBar, ProgressStyle};
 use anyhow::{Result, anyhow};
@@ -24,9 +28,9 @@ use socket2::Socket;
 
 use crate::protocol::transfer::*;
 
-/// Default chunk size for reading/writing (2MB) - fewer syscalls
+/// Default chunk size for reading/writing (4MB) - fewer syscalls
 /// Can be overridden via --chunk flag
-pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Buffer size for file I/O (16MB)  
 const BUFFER_SIZE: usize = 16 * 1024 * 1024;
@@ -45,7 +49,9 @@ const PROGRESS_BYTE_INTERVAL: u64 = 10 * 1024 * 1024;
 const PROGRESS_TIME_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Timeout for individual read/write operations
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Note: For multi-stream transfers with many connections, individual streams
+/// may be idle for extended periods while other streams handle chunks.
+const IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Protocol timeout for handshake
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -219,6 +225,158 @@ async fn write_all_timeout(stream: &mut TcpStream, buf: &[u8], timeout: Duration
     }
 }
 
+async fn handshake_sender(stream: &mut TcpStream) -> Result<()> {
+    info!("Performing sender handshake...");
+    configure_tcp_socket(stream)?;
+
+    let hello = HelloMessage { role: "sender".to_string() };
+    write_all_timeout(stream, &hello.encode(), HANDSHAKE_TIMEOUT).await?;
+    debug!("Sent HELLO");
+
+    let mut buf = [0u8; 256];
+    read_exact_timeout(stream, &mut buf[..5], HANDSHAKE_TIMEOUT).await?;
+
+    if buf[0] != MessageType::Hello as u8 {
+        return Err(anyhow!("Expected HELLO, got type {}", buf[0]));
+    }
+
+    let len = (&buf[1..5]).get_u32() as usize;
+    read_exact_timeout(stream, &mut buf[5..5 + len], HANDSHAKE_TIMEOUT).await?;
+
+    if let Some(hello) = HelloMessage::decode(&buf[..5 + len]) {
+        if hello.role != "receiver" {
+            return Err(anyhow!("Expected receiver, got {}", hello.role));
+        }
+        info!("Received HELLO from receiver");
+    } else {
+        return Err(anyhow!("Failed to parse HELLO"));
+    }
+
+    Ok(())
+}
+
+async fn handshake_receiver(stream: &mut TcpStream) -> Result<()> {
+    info!("Performing receiver handshake...");
+    configure_tcp_socket(stream)?;
+
+    let mut buf = [0u8; 256];
+    read_exact_timeout(stream, &mut buf[..5], HANDSHAKE_TIMEOUT).await?;
+
+    if buf[0] != MessageType::Hello as u8 {
+        return Err(anyhow!("Expected HELLO, got type {}", buf[0]));
+    }
+
+    let len = (&buf[1..5]).get_u32() as usize;
+    read_exact_timeout(stream, &mut buf[5..5 + len], HANDSHAKE_TIMEOUT).await?;
+
+    if let Some(hello) = HelloMessage::decode(&buf[..5 + len]) {
+        if hello.role != "sender" {
+            return Err(anyhow!("Expected sender, got {}", hello.role));
+        }
+        info!("Received HELLO from sender");
+    } else {
+        return Err(anyhow!("Failed to parse HELLO"));
+    }
+
+    let hello = HelloMessage { role: "receiver".to_string() };
+    write_all_timeout(stream, &hello.encode(), HANDSHAKE_TIMEOUT).await?;
+    debug!("Sent HELLO");
+
+    Ok(())
+}
+
+async fn send_stream_info(stream: &mut TcpStream, stream_index: u32, total_streams: u32) -> Result<()> {
+    let info = StreamInfoMessage { stream_index, total_streams };
+    write_all_timeout(stream, &info.encode(), HANDSHAKE_TIMEOUT).await?;
+
+    let mut buf = [0u8; 1];
+    read_exact_timeout(stream, &mut buf, HANDSHAKE_TIMEOUT).await?;
+    if buf[0] != MessageType::StreamInfoAck as u8 {
+        return Err(anyhow!("Expected STREAM_INFO_ACK, got type {}", buf[0]));
+    }
+    Ok(())
+}
+
+async fn recv_stream_info(stream: &mut TcpStream) -> Result<StreamInfoMessage> {
+    let mut buf = [0u8; 9];
+    read_exact_timeout(stream, &mut buf, HANDSHAKE_TIMEOUT).await?;
+    if buf[0] != MessageType::StreamInfo as u8 {
+        return Err(anyhow!("Expected STREAM_INFO, got type {}", buf[0]));
+    }
+    let info = StreamInfoMessage::decode(&buf)
+        .ok_or_else(|| anyhow!("Failed to parse STREAM_INFO"))?;
+
+    let ack = encode_simple(MessageType::StreamInfoAck);
+    write_all_timeout(stream, &ack, HANDSHAKE_TIMEOUT).await?;
+    Ok(info)
+}
+
+async fn send_file_info_on_stream(
+    stream: &mut TcpStream,
+    file_path: &str,
+    file_size: u64,
+    sha256: [u8; 32],
+) -> Result<()> {
+    let filename = Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let file_info = FileInfoMessage {
+        filename: filename.clone(),
+        file_size,
+        sha256,
+    };
+
+    info!("Sending file info: {} ({:.2} MB)", filename, file_size as f64 / (1024.0 * 1024.0));
+    info!("Chunk size: {} KB", get_chunk_size() / 1024);
+
+    write_all_timeout(stream, &file_info.encode(), HANDSHAKE_TIMEOUT).await?;
+
+    let mut buf = [0u8; 1];
+    read_exact_timeout(stream, &mut buf, HANDSHAKE_TIMEOUT).await?;
+
+    if buf[0] != MessageType::FileInfoAck as u8 {
+        return Err(anyhow!("Expected FILE_INFO_ACK, got type {}", buf[0]));
+    }
+
+    info!("File info acknowledged");
+    Ok(())
+}
+
+async fn receive_file_info_from_stream(stream: &mut TcpStream) -> Result<FileInfoMessage> {
+    let mut header = [0u8; 13];
+    read_exact_timeout(stream, &mut header, HANDSHAKE_TIMEOUT).await?;
+
+    if header[0] != MessageType::FileInfo as u8 {
+        return Err(anyhow!("Expected FILE_INFO, got type {}", header[0]));
+    }
+
+    let name_len = (&header[1..5]).get_u32() as usize;
+    let file_size = (&header[5..13]).get_u64();
+
+    let mut name_and_hash = vec![0u8; name_len + 32];
+    read_exact_timeout(stream, &mut name_and_hash, HANDSHAKE_TIMEOUT).await?;
+
+    let filename = String::from_utf8(name_and_hash[..name_len].to_vec())
+        .map_err(|_| anyhow!("Invalid filename encoding"))?;
+
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(&name_and_hash[name_len..]);
+
+    let info = FileInfoMessage { filename, file_size, sha256 };
+
+    info!("Receiving: {} ({:.2} MB)", info.filename, info.file_size as f64 / (1024.0 * 1024.0));
+    info!("Expected SHA256: {}", sha256_to_hex(&info.sha256));
+
+    let ack = encode_simple(MessageType::FileInfoAck);
+    write_all_timeout(stream, &ack, HANDSHAKE_TIMEOUT).await?;
+    info!("File info acknowledged");
+
+    Ok(info)
+}
+
 /// File sender over TCP
 pub struct TcpSender {
     stream: TcpStream,
@@ -239,62 +397,11 @@ impl TcpSender {
     }
 
     async fn handshake(&mut self) -> Result<()> {
-        info!("Performing sender handshake...");
-        configure_tcp_socket(&self.stream)?;
-        
-        let hello = HelloMessage { role: "sender".to_string() };
-        write_all_timeout(&mut self.stream, &hello.encode(), HANDSHAKE_TIMEOUT).await?;
-        debug!("Sent HELLO");
-        
-        let mut buf = [0u8; 256];
-        read_exact_timeout(&mut self.stream, &mut buf[..5], HANDSHAKE_TIMEOUT).await?;
-        
-        if buf[0] != MessageType::Hello as u8 {
-            return Err(anyhow!("Expected HELLO, got type {}", buf[0]));
-        }
-        
-        let len = (&buf[1..5]).get_u32() as usize;
-        read_exact_timeout(&mut self.stream, &mut buf[5..5+len], HANDSHAKE_TIMEOUT).await?;
-        
-        if let Some(hello) = HelloMessage::decode(&buf[..5+len]) {
-            if hello.role != "receiver" {
-                return Err(anyhow!("Expected receiver, got {}", hello.role));
-            }
-            info!("Received HELLO from receiver");
-        } else {
-            return Err(anyhow!("Failed to parse HELLO"));
-        }
-        
-        Ok(())
+        handshake_sender(&mut self.stream).await
     }
 
     async fn send_file_info(&mut self) -> Result<()> {
-        let filename = Path::new(&self.file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        
-        let file_info = FileInfoMessage {
-            filename: filename.clone(),
-            file_size: self.file_size,
-            sha256: self.sha256,
-        };
-        
-        info!("Sending file info: {} ({:.2} MB)", filename, self.file_size as f64 / (1024.0 * 1024.0));
-        info!("Chunk size: {} KB", get_chunk_size() / 1024);
-        
-        write_all_timeout(&mut self.stream, &file_info.encode(), HANDSHAKE_TIMEOUT).await?;
-        
-        let mut buf = [0u8; 1];
-        read_exact_timeout(&mut self.stream, &mut buf, HANDSHAKE_TIMEOUT).await?;
-        
-        if buf[0] != MessageType::FileInfoAck as u8 {
-            return Err(anyhow!("Expected FILE_INFO_ACK, got type {}", buf[0]));
-        }
-        
-        info!("File info acknowledged");
-        Ok(())
+        send_file_info_on_stream(&mut self.stream, &self.file_path, self.file_size, self.sha256).await
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -392,68 +499,13 @@ impl TcpReceiver {
     }
 
     async fn handshake(&mut self) -> Result<()> {
-        info!("Performing receiver handshake...");
         let stream = self.stream.as_mut().ok_or_else(|| anyhow!("Stream not available"))?;
-        configure_tcp_socket(stream)?;
-        
-        let mut buf = [0u8; 256];
-        read_exact_timeout(stream, &mut buf[..5], HANDSHAKE_TIMEOUT).await?;
-        
-        if buf[0] != MessageType::Hello as u8 {
-            return Err(anyhow!("Expected HELLO, got type {}", buf[0]));
-        }
-        
-        let len = (&buf[1..5]).get_u32() as usize;
-        read_exact_timeout(stream, &mut buf[5..5+len], HANDSHAKE_TIMEOUT).await?;
-        
-        if let Some(hello) = HelloMessage::decode(&buf[..5+len]) {
-            if hello.role != "sender" {
-                return Err(anyhow!("Expected sender, got {}", hello.role));
-            }
-            info!("Received HELLO from sender");
-        } else {
-            return Err(anyhow!("Failed to parse HELLO"));
-        }
-        
-        let hello = HelloMessage { role: "receiver".to_string() };
-        write_all_timeout(stream, &hello.encode(), HANDSHAKE_TIMEOUT).await?;
-        debug!("Sent HELLO");
-        
-        Ok(())
+        handshake_receiver(stream).await
     }
 
     async fn receive_file_info(&mut self) -> Result<FileInfoMessage> {
         let stream = self.stream.as_mut().ok_or_else(|| anyhow!("Stream not available"))?;
-        
-        let mut header = [0u8; 13];
-        read_exact_timeout(stream, &mut header, HANDSHAKE_TIMEOUT).await?;
-        
-        if header[0] != MessageType::FileInfo as u8 {
-            return Err(anyhow!("Expected FILE_INFO, got type {}", header[0]));
-        }
-        
-        let name_len = (&header[1..5]).get_u32() as usize;
-        let file_size = (&header[5..13]).get_u64();
-        
-        let mut name_and_hash = vec![0u8; name_len + 32];
-        read_exact_timeout(stream, &mut name_and_hash, HANDSHAKE_TIMEOUT).await?;
-        
-        let filename = String::from_utf8(name_and_hash[..name_len].to_vec())
-            .map_err(|_| anyhow!("Invalid filename encoding"))?;
-        
-        let mut sha256 = [0u8; 32];
-        sha256.copy_from_slice(&name_and_hash[name_len..]);
-        
-        let info = FileInfoMessage { filename, file_size, sha256 };
-        
-        info!("Receiving: {} ({:.2} MB)", info.filename, info.file_size as f64 / (1024.0 * 1024.0));
-        info!("Expected SHA256: {}", sha256_to_hex(&info.sha256));
-        
-        let ack = encode_simple(MessageType::FileInfoAck);
-        write_all_timeout(stream, &ack, HANDSHAKE_TIMEOUT).await?;
-        info!("File info acknowledged");
-        
-        Ok(info)
+        receive_file_info_from_stream(stream).await
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -608,5 +660,538 @@ impl TcpReceiver {
             progress_bar.finish_with_message("❌ SHA256 verification failed!".to_string());
             Err(anyhow!("SHA256 verification failed"))
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Chunk {
+    id: u32,
+    offset: u64,
+    len: u32,
+}
+
+struct WriteChunk {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+fn build_chunks(file_size: u64, chunk_size: usize) -> VecDeque<Chunk> {
+    let mut chunks = VecDeque::new();
+    if file_size == 0 {
+        return chunks;
+    }
+    let mut offset: u64 = 0;
+    let mut id: u32 = 0;
+    let chunk_size = chunk_size as u64;
+    while offset < file_size {
+        let remaining = file_size - offset;
+        let len = std::cmp::min(remaining, chunk_size) as u32;
+        chunks.push_back(Chunk { id, offset, len });
+        offset += len as u64;
+        id = id.wrapping_add(1);
+    }
+    chunks
+}
+
+async fn send_chunk_ack(stream: &mut TcpStream, chunk_id: u32) -> Result<()> {
+    let msg = ChunkAckMessage { chunk_id };
+    write_all_timeout(stream, &msg.encode(), IO_TIMEOUT).await
+}
+
+async fn read_chunk_ack(stream: &mut TcpStream) -> Result<u32> {
+    let mut buf = [0u8; 5];
+    read_exact_timeout(stream, &mut buf, IO_TIMEOUT).await?;
+    if buf[0] != MessageType::ChunkAck as u8 {
+        return Err(anyhow!("Expected CHUNK_ACK, got type {}", buf[0]));
+    }
+    let mut cursor = &buf[1..];
+    Ok(cursor.get_u32())
+}
+
+async fn sender_worker_loop(
+    stream: &mut TcpStream,
+    file_path: &str,
+    queue: Arc<Mutex<VecDeque<Chunk>>>,
+    remaining: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+    progress: Arc<AtomicU64>,
+) -> Result<()> {
+    let mut file = File::open(file_path).await?;
+    // Reserve space for header (17 bytes) + data
+    const HEADER_SIZE: usize = 17;
+    let mut buffer = vec![0u8; HEADER_SIZE + get_chunk_size()];
+
+    loop {
+        if remaining.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+
+        let chunk_opt = {
+            let mut q = queue.lock().await;
+            q.pop_front()
+        };
+
+        let chunk = match chunk_opt {
+            Some(c) => c,
+            None => {
+                if remaining.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                notify.notified().await;
+                continue;
+            }
+        };
+
+        file.seek(SeekFrom::Start(chunk.offset)).await?;
+        let len = chunk.len as usize;
+        
+        // Read data into buffer after header space
+        if let Err(e) = file.read_exact(&mut buffer[HEADER_SIZE..HEADER_SIZE+len]).await {
+             let mut q = queue.lock().await;
+             q.push_front(chunk);
+             notify.notify_one();
+             return Err(anyhow!("Read error: {}", e));
+        }
+
+        // Serialize header into the beginning
+        let mut header_cursor = &mut buffer[0..HEADER_SIZE];
+        header_cursor.put_u8(MessageType::Data as u8);
+        header_cursor.put_u32(chunk.id);
+        header_cursor.put_u64(chunk.offset);
+        header_cursor.put_u32(chunk.len);
+
+        // Send header + data in one go
+        if let Err(e) = write_all_timeout(stream, &buffer[..HEADER_SIZE+len], IO_TIMEOUT).await {
+            let mut q = queue.lock().await;
+            q.push_front(chunk);
+            notify.notify_one();
+            return Err(e);
+        }
+
+        let ack_res = read_chunk_ack(stream).await;
+        match ack_res {
+            Ok(ack_id) => {
+                if ack_id != chunk.id {
+                    let id = chunk.id;
+                    let mut q = queue.lock().await;
+                    q.push_front(chunk);
+                    notify.notify_one();
+                    return Err(anyhow!("Chunk ACK mismatch: expected {}, got {}", id, ack_id));
+                }
+            }
+            Err(e) => {
+                let mut q = queue.lock().await;
+                q.push_front(chunk);
+                notify.notify_one();
+                return Err(e);
+            }
+        }
+
+        progress.fetch_add(chunk.len as u64, Ordering::Relaxed);
+        let left = remaining.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+        if left == 0 {
+            notify.notify_waiters();
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_data_header(stream: &mut TcpStream) -> Result<Chunk> {
+    let mut header = [0u8; 16];
+    read_exact_timeout(stream, &mut header, IO_TIMEOUT).await?;
+    let mut cursor = &header[..];
+    let chunk_id = cursor.get_u32();
+    let offset = cursor.get_u64();
+    let len = cursor.get_u32();
+    Ok(Chunk { id: chunk_id, offset, len })
+}
+
+type BufferPool = Arc<Mutex<Vec<Vec<u8>>>>;
+
+async fn disk_writer_loop(
+    file_path: String,
+    mut rx: tokio::sync::mpsc::Receiver<WriteChunk>,
+    progress: Arc<AtomicU64>,
+    pool: BufferPool,
+) -> Result<()> {
+    let mut file = OpenOptions::new().write(true).open(file_path).await?;
+    
+    while let Some(chunk) = rx.recv().await {
+        file.seek(SeekFrom::Start(chunk.offset)).await?;
+        file.write_all(&chunk.data).await?;
+        progress.fetch_add(chunk.data.len() as u64, Ordering::Relaxed);
+        
+        // Recycle buffer
+        let data = chunk.data;
+        // Keep capacity, clear content (though next user will overwrite or resize)
+        // No need to clear if we overwrite, but let's just push it back.
+        // Important: check if pool is not excessively large? (optional)
+        pool.lock().await.push(data);
+    }
+    
+    file.flush().await?;
+    Ok(())
+}
+
+async fn receiver_worker_loop(
+    stream: &mut TcpStream,
+    remaining: Arc<AtomicUsize>,
+    done_flags: Arc<Vec<std::sync::atomic::AtomicBool>>,
+    notify: Arc<Notify>,
+    write_tx: tokio::sync::mpsc::Sender<WriteChunk>,
+    expect_done: bool,
+    pool: BufferPool,
+) -> Result<bool> {
+    // We don't allocate a persistent buffer here. We fetch one per chunk.
+    let chunk_size = get_chunk_size();
+
+    loop {
+        if remaining.load(Ordering::Relaxed) == 0 && !expect_done {
+            break;
+        }
+
+        let mut type_buf = [0u8; 1];
+        let read_type = read_exact_timeout(stream, &mut type_buf, IO_TIMEOUT).await;
+        let msg_type = match read_type {
+            Ok(_) => type_buf[0],
+            Err(e) => {
+                if expect_done {
+                    return Err(e);
+                }
+                break;
+            }
+        };
+
+        if msg_type == MessageType::Data as u8 {
+            let chunk = read_data_header(stream).await?;
+            if (chunk.id as usize) >= done_flags.len() {
+                return Err(anyhow!("Invalid chunk id {}", chunk.id));
+            }
+            let len = chunk.len as usize;
+            
+            // Get buffer from pool or allocate
+            let mut buffer = {
+                let mut p = pool.lock().await;
+                p.pop().unwrap_or_else(|| Vec::with_capacity(chunk_size))
+            };
+            // Resize to exact len needed for read, but keep capacity if possible
+            if buffer.len() < len {
+                buffer.resize(len, 0u8);
+            } else {
+                buffer.truncate(len);
+            }
+
+            read_exact_timeout(stream, &mut buffer[..len], IO_TIMEOUT).await?;
+
+            let already_done = done_flags[chunk.id as usize]
+                .swap(true, Ordering::SeqCst);
+            if !already_done {
+                let write_chunk = WriteChunk {
+                    offset: chunk.offset,
+                    data: buffer, // Move ownership
+                };
+                if write_tx.send(write_chunk).await.is_err() {
+                    return Err(anyhow!("Write channel closed"));
+                }
+                
+                let left = remaining.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+                if left == 0 {
+                    notify.notify_waiters();
+                }
+            } else {
+                // Return unused buffer to pool
+                pool.lock().await.push(buffer);
+            }
+
+            send_chunk_ack(stream, chunk.id).await?;
+        } else if msg_type == MessageType::Done as u8 {
+            return Ok(true);
+        } else {
+            return Err(anyhow!("Unexpected frame type {}", msg_type));
+        }
+    }
+
+    Ok(false)
+}
+
+pub async fn run_multi_sender(
+    mut streams: Vec<TcpStream>,
+    file_path: &str,
+    file_size: u64,
+    sha256: [u8; 32],
+) -> Result<()> {
+    if streams.is_empty() {
+        return Err(anyhow!("No streams available for multi-send"));
+    }
+
+    // Sort streams by remote port to ensure both sides agree on ordering
+    streams.sort_by_key(|s| s.peer_addr().map(|a| a.port()).unwrap_or(0));
+    info!("Sorted {} streams by remote port for deterministic ordering", streams.len());
+
+    let total_streams = streams.len();
+    for (i, stream) in streams.iter_mut().enumerate() {
+        handshake_sender(stream).await?;
+        send_stream_info(stream, i as u32, total_streams as u32).await?;
+    }
+
+    let mut control_stream = streams.remove(0);
+    send_file_info_on_stream(&mut control_stream, file_path, file_size, sha256).await?;
+
+    let chunk_size = get_chunk_size();
+    let queue = Arc::new(Mutex::new(build_chunks(file_size, chunk_size)));
+    let total_chunks = queue.lock().await.len();
+    let remaining = Arc::new(AtomicUsize::new(total_chunks));
+    let notify = Arc::new(Notify::new());
+    let progress = Arc::new(AtomicU64::new(0));
+
+    let filename = Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    let progress_bar = create_progress_bar(file_size, filename);
+    let progress_bar_clone = progress_bar.clone();
+    let progress_clone = progress.clone();
+    let progress_handle = tokio::spawn(async move {
+        let check_interval = Duration::from_millis(100);
+        loop {
+            tokio::time::sleep(check_interval).await;
+            let current = progress_clone.load(Ordering::Relaxed);
+            progress_bar_clone.set_position(current);
+            if current >= file_size {
+                break;
+            }
+        }
+    });
+
+    let mut handles = Vec::new();
+    for stream in streams.into_iter() {
+        let queue = queue.clone();
+        let remaining = remaining.clone();
+        let notify = notify.clone();
+        let progress = progress.clone();
+        let path = file_path.to_string();
+        handles.push(tokio::spawn(async move {
+            let mut s = stream;
+            if let Err(e) = sender_worker_loop(&mut s, &path, queue, remaining, notify, progress).await {
+                warn!("Sender stream error: {}", e);
+            }
+        }));
+    }
+
+    if let Err(e) = sender_worker_loop(
+        &mut control_stream,
+        file_path,
+        queue.clone(),
+        remaining.clone(),
+        notify.clone(),
+        progress.clone(),
+    ).await {
+        progress_handle.abort();
+        return Err(e);
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    if remaining.load(Ordering::Relaxed) > 0 {
+        progress_handle.abort();
+        return Err(anyhow!("Transfer incomplete: {} chunks remaining", remaining.load(Ordering::Relaxed)));
+    }
+
+    control_stream.flush().await?;
+
+    let done = encode_simple(MessageType::Done);
+    write_all_timeout(&mut control_stream, &done, HANDSHAKE_TIMEOUT).await?;
+    info!("Sent DONE, waiting for final ACK...");
+
+    let mut buf = [0u8; 1];
+    read_exact_timeout(&mut control_stream, &mut buf, Duration::from_secs(120)).await?;
+    if buf[0] != MessageType::Ack as u8 {
+        return Err(anyhow!("Expected final ACK, got type {}", buf[0]));
+    }
+
+    progress_bar.set_position(file_size);
+    progress_bar.finish_with_message("✅ Transfer complete".to_string());
+    let _ = progress_handle.await;
+    Ok(())
+}
+
+pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
+    let start = Instant::now();
+    if streams.is_empty() {
+        return Err(anyhow!("No streams available for multi-receive"));
+    }
+
+    // Sort streams by remote port to ensure both sides agree on ordering
+    streams.sort_by_key(|s| s.peer_addr().map(|a| a.port()).unwrap_or(0));
+    info!("Sorted {} streams by remote port for deterministic ordering", streams.len());
+
+    let mut total_streams: Option<usize> = None;
+    let mut by_index: Vec<Option<TcpStream>> = Vec::new();
+
+    for mut stream in streams.into_iter() {
+        handshake_receiver(&mut stream).await?;
+        let info = recv_stream_info(&mut stream).await?;
+        let total = info.total_streams as usize;
+        if total == 0 {
+            return Err(anyhow!("Invalid total_streams=0"));
+        }
+        if total_streams.is_none() {
+            total_streams = Some(total);
+            by_index.resize_with(total, || None);
+        } else if total_streams != Some(total) {
+            return Err(anyhow!("Mismatched total_streams across connections"));
+        }
+        let idx = info.stream_index as usize;
+        if idx >= total {
+            return Err(anyhow!("Invalid stream_index {}", idx));
+        }
+        if by_index[idx].is_some() {
+            return Err(anyhow!("Duplicate stream_index {}", idx));
+        }
+        by_index[idx] = Some(stream);
+    }
+
+    let total_streams = total_streams.unwrap_or(0);
+    if by_index.iter().any(|s| s.is_none()) {
+        return Err(anyhow!("Missing stream(s) for multi-transfer"));
+    }
+
+    let mut streams_by_index: Vec<TcpStream> = by_index.into_iter().map(|s| s.unwrap()).collect();
+    if total_streams != streams_by_index.len() {
+        return Err(anyhow!("Stream count mismatch"));
+    }
+
+    let mut control_stream = streams_by_index.remove(0);
+    let file_info = receive_file_info_from_stream(&mut control_stream).await?;
+
+    let temp_path = format!("{}.tmp", file_info.filename);
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&temp_path)
+        .await?;
+    file.set_len(file_info.file_size).await?;
+    drop(file);
+
+    let chunk_size = get_chunk_size() as u64;
+    let total_chunks = if file_info.file_size == 0 {
+        0
+    } else {
+        ((file_info.file_size + chunk_size - 1) / chunk_size) as usize
+    };
+    let remaining = Arc::new(AtomicUsize::new(total_chunks));
+    let done_flags = Arc::new((0..total_chunks).map(|_| AtomicBool::new(false)).collect::<Vec<_>>());
+    let notify = Arc::new(Notify::new());
+    let progress = Arc::new(AtomicU64::new(0));
+    let buffer_pool: BufferPool = Arc::new(Mutex::new(Vec::new()));
+
+    let (write_tx, write_rx) = tokio::sync::mpsc::channel::<WriteChunk>(32);
+    let writer_progress = progress.clone();
+    let temp_path_clone = temp_path.clone();
+    let writer_pool = buffer_pool.clone();
+    
+    let writer_handle = tokio::spawn(async move {
+        disk_writer_loop(temp_path_clone, write_rx, writer_progress, writer_pool).await
+    });
+
+    let progress_bar = create_progress_bar(file_info.file_size, &file_info.filename);
+    let progress_bar_clone = progress_bar.clone();
+    let progress_clone = progress.clone();
+    let progress_handle = tokio::spawn(async move {
+        let check_interval = Duration::from_millis(100);
+        loop {
+            tokio::time::sleep(check_interval).await;
+            let current = progress_clone.load(Ordering::Relaxed);
+            progress_bar_clone.set_position(current);
+            if current >= file_info.file_size {
+                break;
+            }
+        }
+    });
+
+    let mut handles = Vec::new();
+    for stream in streams_by_index.into_iter() {
+        let remaining = remaining.clone();
+        let done_flags = done_flags.clone();
+        let notify = notify.clone();
+        let write_tx = write_tx.clone();
+        let pool = buffer_pool.clone();
+        handles.push(tokio::spawn(async move {
+            let mut s = stream;
+            if let Err(e) = receiver_worker_loop(&mut s, remaining, done_flags, notify, write_tx, false, pool).await {
+                warn!("Receiver stream error: {}", e);
+            }
+        }));
+    }
+
+    let done_seen = match receiver_worker_loop(
+        &mut control_stream,
+        remaining.clone(),
+        done_flags.clone(),
+        notify.clone(),
+        write_tx,
+        true,
+        buffer_pool.clone(),
+    ).await {
+        Ok(v) => v,
+        Err(e) => {
+            progress_handle.abort();
+            return Err(e);
+        }
+    };
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    if !done_seen {
+        progress_handle.abort();
+        return Err(anyhow!("Did not receive DONE on control stream"));
+    }
+
+    while remaining.load(Ordering::Relaxed) > 0 {
+        notify.notified().await;
+    }
+    
+    // Wait for writer to finish flushing
+    writer_handle.await.map_err(|e| anyhow!("Writer task panicked: {}", e))??;
+
+    progress_bar.set_position(file_info.file_size);
+    progress_bar.set_message("Verifying SHA256...");
+    info!("Calculating SHA256 from disk...");
+    let verify_start = Instant::now();
+    let calculated_hash = sha256_file(Path::new(&temp_path)).await?;
+    let verify_time = verify_start.elapsed();
+    info!("SHA256 verification took {:.1}s", verify_time.as_secs_f64());
+
+    if calculated_hash == file_info.sha256 {
+        tokio::fs::rename(&temp_path, &file_info.filename).await?;
+
+        let ack = encode_simple(MessageType::Ack);
+        write_all_timeout(&mut control_stream, &ack, HANDSHAKE_TIMEOUT).await?;
+
+        let elapsed = start.elapsed();
+        let speed_mbps = (file_info.file_size as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+        progress_bar.finish_with_message(format!("✅ Complete! SHA256 verified"));
+        info!("✅ Transfer complete! SHA256 verified.");
+        info!("File saved: {}", file_info.filename);
+        info!("Speed: {:.1} MB/s (incl. verification)", speed_mbps);
+        let _ = progress_handle.await;
+        Ok(())
+    } else {
+        tokio::fs::remove_file(&temp_path).await.ok();
+
+        error!("SHA256 mismatch!");
+        error!("Expected: {}", sha256_to_hex(&file_info.sha256));
+        error!("Got:      {}", sha256_to_hex(&calculated_hash));
+
+        progress_bar.finish_with_message("❌ SHA256 verification failed!".to_string());
+        let _ = progress_handle.await;
+        Err(anyhow!("SHA256 verification failed"))
     }
 }

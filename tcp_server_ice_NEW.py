@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 MIN_PORT = 1024
 MAX_PORT = 65535
 MAX_SCAN_PORTS = 512
+DEFAULT_TCP_CONNECTIONS = 1
+DEFAULT_SCAN_BUDGET = 1024
+DEFAULT_PUNCH_OVERSHOOT = 2.0
+DEFAULT_ALLOW_FALLBACK = False
+DEFAULT_MIN_CONNECTIONS = 1
 PREDICTION_DELAY_SEC = 2.0
 RATE_DAMPING = 0.5
 MAX_RATE_SHIFT = 32
@@ -109,6 +114,12 @@ class Peer:
     needs_probing: bool = False  # True if NAT port changed (not preserved)
     prediction_mode: str = "delta"  # delta or external
     prediction_range_extra_pct: float = 0.0  # percent to expand scan range
+    tcp_connections: int = DEFAULT_TCP_CONNECTIONS
+    scan_budget: int = DEFAULT_SCAN_BUDGET
+    punch_overshoot: float = DEFAULT_PUNCH_OVERSHOOT
+    allow_fallback: bool = DEFAULT_ALLOW_FALLBACK
+    min_connections: int = DEFAULT_MIN_CONNECTIONS
+    extra_ports: List[int] = field(default_factory=list)
 
 
 class TCPRelayServerICE:
@@ -419,6 +430,7 @@ class TCPRelayServerICE:
             session_id = msg['session_id']
             role = msg['role']
             local_port = msg.get('local_port', 0)
+            extra_ports = msg.get('extra_ports', [])
             private_ip = msg.get('private_ip')
             skip_probing = msg.get('skip_probing', False)  # For clients that don't support probing
             prediction_mode = (msg.get('prediction_mode') or 'delta').lower()
@@ -434,6 +446,48 @@ class TCPRelayServerICE:
                     range_raw,
                 )
                 prediction_range_extra_pct = 0.0
+
+            tcp_connections = msg.get('tcp_connections', DEFAULT_TCP_CONNECTIONS)
+            scan_budget = msg.get('scan_budget', DEFAULT_SCAN_BUDGET)
+            punch_overshoot = msg.get('punch_overshoot', DEFAULT_PUNCH_OVERSHOOT)
+            allow_fallback = msg.get('allow_fallback', DEFAULT_ALLOW_FALLBACK)
+            min_connections = msg.get('min_connections', DEFAULT_MIN_CONNECTIONS)
+
+            try:
+                tcp_connections = int(tcp_connections)
+            except (TypeError, ValueError):
+                logger.warning("Invalid tcp_connections '%s', defaulting to %s", tcp_connections, DEFAULT_TCP_CONNECTIONS)
+                tcp_connections = DEFAULT_TCP_CONNECTIONS
+
+            try:
+                scan_budget = int(scan_budget)
+            except (TypeError, ValueError):
+                logger.warning("Invalid scan_budget '%s', defaulting to %s", scan_budget, DEFAULT_SCAN_BUDGET)
+                scan_budget = DEFAULT_SCAN_BUDGET
+
+            try:
+                punch_overshoot = float(punch_overshoot)
+            except (TypeError, ValueError):
+                logger.warning("Invalid punch_overshoot '%s', defaulting to %s", punch_overshoot, DEFAULT_PUNCH_OVERSHOOT)
+                punch_overshoot = DEFAULT_PUNCH_OVERSHOOT
+
+            allow_fallback = bool(allow_fallback)
+            try:
+                min_connections = int(min_connections)
+            except (TypeError, ValueError):
+                logger.warning("Invalid min_connections '%s', defaulting to %s", min_connections, DEFAULT_MIN_CONNECTIONS)
+                min_connections = DEFAULT_MIN_CONNECTIONS
+
+            if tcp_connections < 1:
+                tcp_connections = DEFAULT_TCP_CONNECTIONS
+            if scan_budget < 0:
+                scan_budget = DEFAULT_SCAN_BUDGET
+            if punch_overshoot < 1.0:
+                punch_overshoot = DEFAULT_PUNCH_OVERSHOOT
+            if min_connections < 1:
+                min_connections = DEFAULT_MIN_CONNECTIONS
+            if min_connections > tcp_connections:
+                min_connections = tcp_connections
             
             if role not in ('sender', 'receiver'):
                 await self.send_error(writer, f"Invalid role: {role}")
@@ -449,6 +503,12 @@ class TCPRelayServerICE:
                 private_ip=private_ip,
                 prediction_mode=prediction_mode,
                 prediction_range_extra_pct=prediction_range_extra_pct,
+                tcp_connections=tcp_connections,
+                scan_budget=scan_budget,
+                punch_overshoot=punch_overshoot,
+                allow_fallback=allow_fallback,
+                min_connections=min_connections,
+                extra_ports=extra_ports,
             )
             
             lock = self.get_session_lock(session_id)
@@ -587,6 +647,35 @@ class TCPRelayServerICE:
                     logger.info(f"Peer {peer.role} is READY")
                     await self.try_send_go(peer.session_id)
                 
+                elif msg_type == 'add_ports':
+                    # New: Receiver adding ports dynamically
+                    new_ports = msg.get('ports', [])
+                    if not new_ports:
+                        continue
+                    
+                    logger.info(f"Peer {peer.role} adding {len(new_ports)} ports")
+                    # Update peer's extra_ports
+                    # We should probably deduplicate
+                    existing = set(peer.extra_ports)
+                    for p in new_ports:
+                        if p not in existing:
+                            peer.extra_ports.append(p)
+                            existing.add(p)
+                    
+                    # Forward to other peer immediately
+                    lock = self.get_session_lock(peer.session_id)
+                    async with lock:
+                        session = self.sessions.get(peer.session_id)
+                        if session:
+                            other_role = 'sender' if peer.role == 'receiver' else 'receiver'
+                            other_peer = session.get(other_role)
+                            if other_peer:
+                                await self.send_message(other_peer.writer, {
+                                    'type': 'peer_added_ports',
+                                    'ports': new_ports
+                                })
+                                logger.info(f"Forwarded {len(new_ports)} added ports to {other_role}")
+
                 elif msg_type == 'keepalive':
                     await self.send_message(peer.writer, {'type': 'keepalive_ack'})
                 
@@ -718,6 +807,12 @@ class TCPRelayServerICE:
             receiver_addrs = self.get_peer_addresses_with_prediction(receiver, sender)
             
             # Send to sender
+            sender_tcp_connections = sender.tcp_connections if sender else DEFAULT_TCP_CONNECTIONS
+            sender_scan_budget = sender.scan_budget if sender else DEFAULT_SCAN_BUDGET
+            sender_punch_overshoot = sender.punch_overshoot if sender else DEFAULT_PUNCH_OVERSHOOT
+            sender_allow_fallback = sender.allow_fallback if sender else DEFAULT_ALLOW_FALLBACK
+            sender_min_connections = sender.min_connections if sender else DEFAULT_MIN_CONNECTIONS
+
             msg_to_sender = {
                 'type': 'peer_info',
                 'peer_public_addr': list(receiver.public_addr),
@@ -725,7 +820,13 @@ class TCPRelayServerICE:
                 'peer_addresses': receiver_addrs,
                 'your_role': 'sender',
                 'same_network': False,
-                'peer_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None
+                'peer_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None,
+                'tcp_connections': sender_tcp_connections,
+                'scan_budget': sender_scan_budget,
+                'punch_overshoot': sender_punch_overshoot,
+                'allow_fallback': sender_allow_fallback,
+                'min_connections': sender_min_connections,
+                'peer_extra_ports': receiver.extra_ports,
             }
             await self.send_message(sender.writer, msg_to_sender)
             
@@ -737,7 +838,13 @@ class TCPRelayServerICE:
                 'peer_addresses': sender_addrs,
                 'your_role': 'receiver',
                 'same_network': False,
-                'peer_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None
+                'peer_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None,
+                'tcp_connections': sender_tcp_connections,
+                'scan_budget': sender_scan_budget,
+                'punch_overshoot': sender_punch_overshoot,
+                'allow_fallback': sender_allow_fallback,
+                'min_connections': sender_min_connections,
+                'peer_extra_ports': sender.extra_ports,
             }
             await self.send_message(receiver.writer, msg_to_receiver)
             

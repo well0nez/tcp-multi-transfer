@@ -124,6 +124,12 @@ Options:
       --prediction-mode <MODE>  NAT prediction mode: delta or external [default: delta]
       --prediction-range-extra-pct <PCT>  Expand scan range by percentage [default: 0]
       --debug                Enable debug logging
+      --tcp-connections <N>  Number of parallel TCP connections (multi TCP) [default: 1]
+      --scan-budget <N>      Global scan budget across all connections (0 = unlimited) [default: 1024]
+      --punch-overshoot <N>  Overshoot factor for hole punching (starts N*tcp_connections punches) [default: 2]
+      --allow-fallback       Allow fallback if fewer connections are established
+      --min-connections <N>  Minimum connections required when fallback is enabled [default: 1]
+      --chunk <CHUNK>        Chunk size for transfer (e.g., 512KB, 1MB, 4MB) [default: 4MB]
   -h, --help                 Print help
   -V, --version              Print version
 ```
