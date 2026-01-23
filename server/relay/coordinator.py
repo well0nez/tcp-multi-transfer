@@ -57,7 +57,10 @@ async def coordinate_multi_connections(
         )
         
         # 2. Warte auf BEIDE READYs
-        max_wait = 30.0  # 30 Sekunden Timeout
+        # Dynamisches Timeout: Mehr Connections = mehr Zeit für Receiver-Probing
+        # Base: 30s, +15s pro zusätzlicher Connection (für Binding + Probing)
+        max_wait = 30.0 + (tcp_connections - 1) * 15.0
+        logger.debug(f"Session {session_id}: Using dynamic timeout {max_wait:.1f}s for {tcp_connections} connections")
         start_wait = time.time()
         
         while True:
