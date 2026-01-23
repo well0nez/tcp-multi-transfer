@@ -5,3 +5,7 @@ __pycache__/
 *.pyd
 *.log
 MULTI_TCP_PLAN.md
+
+# Backup directories
+copy/
+original/
