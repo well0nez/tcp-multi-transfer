@@ -172,6 +172,7 @@ async fn punch_scan(
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
     let listener_local_port = listener.local_addr()?.port();
+    info!("📡 Listener ready on port {}", listener_local_port);
     
     // Channel für Kandidaten
     let channel_capacity = peer_addresses.len().saturating_add(2).max(4);
