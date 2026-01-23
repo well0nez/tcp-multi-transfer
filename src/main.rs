@@ -386,7 +386,7 @@ async fn receive_peer_info_for_connection(
 ) -> Result<(PeerInfo, String, u32)> {
     loop {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(120), relay_reader.read_line(&mut line))
+        let _ = tokio::time::timeout(Duration::from_secs(120), relay_reader.read_line(&mut line))
             .await
             .map_err(|_| anyhow!("Timeout waiting for peer_info (120s)"))?;
         
@@ -650,7 +650,7 @@ async fn run_sender(
     }
     let local_port = *extra_ports.first().unwrap_or(&local_port_base);
 
-    let (relay_stream, session) = run_relay_protocol(
+    let (relay_stream, mut session) = run_relay_protocol(
         server_addr, session_id, "sender", local_port, timeout, probe_count,
         prediction_mode, prediction_range_extra_pct, tcp_connections, scan_budget,
         punch_overshoot, allow_fallback, min_connections, extra_ports, bound_sockets
@@ -661,11 +661,12 @@ async fn run_sender(
     let relay_reader = BufReader::new(relay_reader);
 
     // NEU: Etabliere Connections mit strategie-basiertem Hole Punching
+    let tcp_conns = session.tcp_connections;  // Copy before mutable borrow
     let streams = establish_multi_connections(
         relay_reader,
         relay_writer,
-        &session,
-        session.tcp_connections,
+        &mut session,
+        tcp_conns,
         timeout,
     ).await?;
 
@@ -732,7 +733,7 @@ async fn run_receiver(
     }
     let local_port = *extra_ports.first().unwrap_or(&local_port_base);
 
-    let (relay_stream, session) = run_relay_protocol(
+    let (relay_stream, mut session) = run_relay_protocol(
         server_addr, session_id, "receiver", local_port, timeout, probe_count,
         prediction_mode, prediction_range_extra_pct, tcp_connections, scan_budget,
         punch_overshoot, allow_fallback, min_connections, extra_ports, bound_sockets
@@ -743,11 +744,12 @@ async fn run_receiver(
     let relay_reader = BufReader::new(relay_reader);
 
     // NEU: Etabliere Connections mit strategie-basiertem Hole Punching
+    let tcp_conns = session.tcp_connections;  // Copy before mutable borrow
     let streams = establish_multi_connections(
         relay_reader,
         relay_writer,
-        &session,
-        session.tcp_connections,
+        &mut session,
+        tcp_conns,
         timeout,
     ).await?;
 
