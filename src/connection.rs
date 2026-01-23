@@ -285,6 +285,61 @@ pub async fn establish_multi_connections(
         // Schleife startet bei 1 (erste Connection bereits etabliert)
         (peer_tcp_connections, 1)
     } else {
+        // Sender: Check if we need to bind more sockets
+        let current_socket_count = session.bound_sockets.len() as u32;
+        
+        if tcp_connections > current_socket_count {
+            let needed_more = (tcp_connections - current_socket_count) as usize;
+            info!("🔄 Sender: Binding {} more sockets...", needed_more);
+            
+            let next_port = if let Some(last) = session.bound_sockets.last() {
+                last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
+            } else {
+                0
+            };
+            
+            if next_port > 0 {
+                let mut new_ports = Vec::new();
+                let mut added_count = 0;
+                let mut current_port = next_port;
+                let mut attempt_counter = 0;
+                
+                while added_count < needed_more && attempt_counter < 100 {
+                    match create_bound_socket(current_port) {
+                        Ok(s) => {
+                            session.bound_sockets.push(s);
+                            new_ports.push(current_port);
+                            added_count += 1;
+                            debug!("Bound extra socket on port {}", current_port);
+                        },
+                        Err(_) => {}
+                    }
+                    current_port = current_port.wrapping_add(1);
+                    attempt_counter += 1;
+                }
+                
+                info!("✓ Bound {} additional sockets (total: {})", added_count, session.bound_sockets.len());
+                
+                // Sender: NO probing needed for Port-Preserved NATs!
+                // Just send add_ports message so server knows the bound ports
+                if !new_ports.is_empty() {
+                    info!("📤 Sender: Sending add_ports for {} new ports (no probing needed for Port-Preserved NAT)", new_ports.len());
+                    
+                    let add_msg = AddPortsMessage::new(session_id, new_ports.clone());
+                    let json = serde_json::to_string(&add_msg)? + "\n";
+                    relay_writer.write_all(json.as_bytes()).await?;
+                    relay_writer.flush().await?;
+                    info!("✓ Sent add_ports message");
+                    
+                    // Wait for ACK
+                    match wait_for_ports_added_ack(&mut relay_reader, &new_ports).await {
+                        Ok(_) => info!("✓ New ports confirmed by server"),
+                        Err(e) => warn!("⚠️ Failed to get ACK for new ports: {}", e),
+                    }
+                }
+            }
+        }
+        
         // Sender weiß schon, wie viele er will - Schleife startet bei 0
         (tcp_connections, 0)
     };
