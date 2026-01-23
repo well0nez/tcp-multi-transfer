@@ -124,6 +124,42 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
                     'ports': ports
                 })
                 logger.info(f"Notified {other_peer.role} about {len(ports)} new ports from {peer.role}")
+            
+            # NEU: Prüfe ob das ein Retry-Port ist (für Retry-Koordination)
+            if hasattr(session, 'retry_add_ports_pending') and session.get('retry_add_ports_pending'):
+                # Finde die Connection für die wir auf add_ports warten
+                for conn_num, pending in session['retry_add_ports_pending'].items():
+                    if not pending[peer.role]:
+                        # Dieser Peer hat jetzt add_ports gesendet!
+                        pending[peer.role] = True
+                        logger.info(f"Session {session_id}: Peer {peer.role} sent add_ports for retry connection {conn_num}")
+                        
+                        # Prüfe ob BEIDE Peers ihre add_ports gesendet haben
+                        sender = session.get('sender')
+                        receiver = session.get('receiver')
+                        
+                        if sender and receiver and pending['sender'] and pending['receiver']:
+                            logger.info(f"Session {session_id}: BOTH peers sent add_ports for retry connection {conn_num} - sending updated peer_info!")
+                            
+                            # Sende NEUE peer_info mit aktualisierten Ports!
+                            from .coordinator import send_peer_info_for_connection
+                            
+                            max_scan_ports = pending['max_scan_ports']
+                            
+                            await send_peer_info_for_connection(
+                                session_id,
+                                sender,
+                                receiver,
+                                conn_num,
+                                max_scan_ports,
+                                session_manager
+                            )
+                            
+                            # Entferne pending Flag
+                            del session['retry_add_ports_pending'][conn_num]
+                            logger.info(f"Session {session_id}: Updated peer_info sent for retry connection {conn_num}, waiting for new READYs")
+                        
+                        break  # Nur den ersten pending Retry verarbeiten
 
 
 async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: int):
@@ -266,27 +302,15 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager):
             sender.ready_for_connection[conn_num] = False
             receiver.ready_for_connection[conn_num] = False
             
-            logger.info(f"Session {session_id}: Retry granted for connection {conn_num}, waiting for new add_ports")
+            # Setze Flag: Wir warten auf add_ports von BEIDEN Peers für diese Connection
+            if not hasattr(session, 'retry_add_ports_pending'):
+                session['retry_add_ports_pending'] = {}
+            session['retry_add_ports_pending'][conn_num] = {
+                'sender': False,
+                'receiver': False,
+                'max_scan_ports': sender.scan_budget or receiver.scan_budget or 100
+            }
             
-            # Warte kurz auf add_ports von beiden (0.5s sollte reichen)
-            await asyncio.sleep(0.5)
-            
-            # Sende NEUE peer_info mit aktualisierten Ports!
-            from .coordinator import send_peer_info_for_connection
-            
-            # Ermittle max_scan_ports (aus Session-Config oder Default)
-            max_scan_ports = sender.scan_budget or receiver.scan_budget or 100
-            
-            logger.info(f"Session {session_id}: Sending updated peer_info for connection {conn_num} after retry")
-            await send_peer_info_for_connection(
-                session_id,
-                sender,
-                receiver,
-                conn_num,
-                max_scan_ports,
-                session_manager
-            )
-            
-            logger.info(f"Session {session_id}: Updated peer_info sent, waiting for new READYs")
+            logger.info(f"Session {session_id}: Retry granted for connection {conn_num}, waiting for add_ports from BOTH peers")
         else:
             logger.info(f"Session {session_id}: Waiting for other peer to request retry for connection {conn_num}")
