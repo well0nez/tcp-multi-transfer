@@ -108,20 +108,27 @@ pub async fn probe_new_ports(
     
     for &local_port in new_ports {
         debug!("  Probing port {}...", local_port);
-        let socket = create_bound_socket(local_port)?;
-        socket.set_nonblocking(true)?;
         
+        // FIX: Create NEW socket for EACH probe (like do_nat_probing does)
         for probe_num in 0..probes_per_port {
             total_attempts += 1;
             
-            // Clone socket for connection attempt
-            let sock_clone = socket.try_clone()?;
-            let _ = sock_clone.connect(&probe_addr.into());
+            // Create fresh socket for this probe
+            let socket = match create_bound_socket(local_port) {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("    Probe {}/{} for port {} - socket binding failed: {}", probe_num + 1, probes_per_port, local_port, e);
+                    continue;
+                }
+            };
             
-            let std_stream: std::net::TcpStream = sock_clone.into();
+            socket.set_nonblocking(true)?;
+            let _ = socket.connect(&probe_addr.into());
+            
+            let std_stream: std::net::TcpStream = socket.into();
             match TcpStream::from_std(std_stream) {
                 Ok(stream) => {
-                    // Wait for connection
+                    // Wait for connection to be writable
                     if stream.writable().await.is_ok() {
                         let probe = ProbeMessage::new(session_id, local_port, probe_num);
                         let msg = serde_json::to_string(&probe).unwrap_or_default() + "\n";
@@ -141,12 +148,14 @@ pub async fn probe_new_ports(
     }
     
     let expected = new_ports.len() as u32 * probes_per_port;
-    if total_successful >= (expected / 2) {
+    // Accept if at least 40% of probes succeeded (more lenient threshold)
+    let min_required = (expected * 2) / 5;  // 40% = 2/5
+    if total_successful >= min_required {
         info!("  ✓ Sent {}/{} probes successfully for new ports", total_successful, total_attempts);
         Ok(())
     } else {
-        warn!("  ⚠️ Only {}/{} probes succeeded for new ports", total_successful, total_attempts);
-        Err(anyhow!("Insufficient successful probes: {}/{}", total_successful, expected))
+        warn!("  ⚠️ Only {}/{} probes succeeded for new ports (need {})", total_successful, total_attempts, min_required);
+        Err(anyhow!("Insufficient successful probes: {}/{} (need {})", total_successful, expected, min_required))
     }
 }
 
