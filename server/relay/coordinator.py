@@ -123,6 +123,10 @@ async def send_peer_info_for_connection(
     receiver_addrs = get_peer_addresses_with_prediction(receiver, sender, max_scan_ports)
     
     # Sende an Sender
+    # WICHTIG: Im SCAN Mode braucht der Peer seine EIGENE NAT-Analyse (für Scan-Range),
+    # nicht die des Peers! Nur im LISTEN/CONNECT Mode ist die Peer-NAT wichtig.
+    sender_nat_to_send = sender.nat_analysis if sender_strategy == "scan" else receiver.nat_analysis
+    
     msg_to_sender = {
         'type': 'peer_info',
         'connection_num': conn_num,
@@ -131,12 +135,15 @@ async def send_peer_info_for_connection(
         'peer_addresses': receiver_addrs,
         'your_role': 'sender',
         'same_network': False,
-        'peer_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None,
+        'peer_nat_analysis': sender_nat_to_send.to_dict() if sender_nat_to_send else None,
         'punch_strategy': sender_strategy,
     }
     await send_message(sender.writer, msg_to_sender)
     
     # Sende an Receiver
+    # Gleiche Logik: Im SCAN Mode braucht der Receiver seine EIGENE NAT-Analyse
+    receiver_nat_to_send = receiver.nat_analysis if receiver_strategy == "scan" else sender.nat_analysis
+    
     msg_to_receiver = {
         'type': 'peer_info',
         'connection_num': conn_num,
@@ -145,7 +152,7 @@ async def send_peer_info_for_connection(
         'peer_addresses': sender_addrs,
         'your_role': 'receiver',
         'same_network': False,
-        'peer_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None,
+        'peer_nat_analysis': receiver_nat_to_send.to_dict() if receiver_nat_to_send else None,
         'punch_strategy': receiver_strategy,
     }
     await send_message(receiver.writer, msg_to_receiver)
