@@ -126,9 +126,22 @@ async def send_peer_info_for_connection(
     sender_strategy = determine_punch_strategy(sender, receiver)
     receiver_strategy = determine_punch_strategy(receiver, sender)
     
-    # Baue peer_addresses (bleibt gleich, aber mit FESTER Range)
-    sender_addrs = get_peer_addresses_with_prediction(sender, receiver, max_scan_ports)
-    receiver_addrs = get_peer_addresses_with_prediction(receiver, sender, max_scan_ports)
+    # FIX: Baue peer_addresses mit den RICHTIGEN per-Connection NAT-Ports!
+    # Statt get_peer_addresses_with_prediction() (verwendet ersten Port),
+    # verwenden wir direkt die berechneten NAT-Ports für diese Connection.
+    sender_addrs = [{
+        "ip": sender.public_addr[0],
+        "port": sender_nat_port,  # ← Richtiger Port für DIESE Connection!
+        "addr_type": "public"
+    }]
+    
+    receiver_addrs = [{
+        "ip": receiver.public_addr[0],
+        "port": receiver_nat_port,  # ← Richtiger Port für DIESE Connection!
+        "addr_type": "public"
+    }]
+    
+    logger.debug(f"Connection {conn_num}: sender_addrs={sender_addrs}, receiver_addrs={receiver_addrs}")
     
     # Sende an Sender
     # peer_nat_analysis = NAT-Analyse des PEERS (Port-Range zum Scannen)
