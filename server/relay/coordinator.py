@@ -123,10 +123,8 @@ async def send_peer_info_for_connection(
     receiver_addrs = get_peer_addresses_with_prediction(receiver, sender, max_scan_ports)
     
     # Sende an Sender
-    # WICHTIG: Im SCAN Mode braucht der Peer seine EIGENE NAT-Analyse (für Scan-Range),
-    # nicht die des Peers! Nur im LISTEN/CONNECT Mode ist die Peer-NAT wichtig.
-    sender_nat_to_send = sender.nat_analysis if sender_strategy == "scan" else receiver.nat_analysis
-    
+    # peer_nat_analysis = NAT-Analyse des PEERS (Port-Range zum Scannen)
+    # Der Sender scannt die Port-Range des Receivers
     msg_to_sender = {
         'type': 'peer_info',
         'connection_num': conn_num,
@@ -135,15 +133,14 @@ async def send_peer_info_for_connection(
         'peer_addresses': receiver_addrs,
         'your_role': 'sender',
         'same_network': False,
-        'peer_nat_analysis': sender_nat_to_send.to_dict() if sender_nat_to_send else None,
+        'peer_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None,
         'punch_strategy': sender_strategy,
     }
     await send_message(sender.writer, msg_to_sender)
     
     # Sende an Receiver
-    # Gleiche Logik: Im SCAN Mode braucht der Receiver seine EIGENE NAT-Analyse
-    receiver_nat_to_send = receiver.nat_analysis if receiver_strategy == "scan" else sender.nat_analysis
-    
+    # peer_nat_analysis = NAT-Analyse des PEERS (Port-Range zum Scannen)
+    # Der Receiver scannt die Port-Range des Senders
     msg_to_receiver = {
         'type': 'peer_info',
         'connection_num': conn_num,
@@ -152,7 +149,7 @@ async def send_peer_info_for_connection(
         'peer_addresses': sender_addrs,
         'your_role': 'receiver',
         'same_network': False,
-        'peer_nat_analysis': receiver_nat_to_send.to_dict() if receiver_nat_to_send else None,
+        'peer_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None,
         'punch_strategy': receiver_strategy,
     }
     await send_message(receiver.writer, msg_to_receiver)
@@ -166,9 +163,11 @@ def determine_punch_strategy(my_peer, other_peer) -> str:
     Bestimme Punch-Strategie basierend auf NAT-Typen.
     
     Strategien:
-    - "listen": Warte auf eingehende Verbindung (NAT-friendly)
+    - "listen": Warte auf eingehende Verbindung (NAT-friendly zu NAT-friendly)
     - "connect": Direkter Connect (NAT-friendly zu NAT-friendly)
-    - "scan": Scanne Port-Range (Complex NAT)
+    - "scan": Scanne Port-Range + Listener parallel (Complex NAT oder gemischt)
+    
+    Wichtig: Im SCAN Mode läuft IMMER ein Listener parallel zum Scanner!
     """
     my_nat = my_peer.nat_analysis
     other_nat = other_peer.nat_analysis
@@ -180,11 +179,11 @@ def determine_punch_strategy(my_peer, other_peer) -> str:
         # Beide NAT-friendly: Einer listet, einer connected
         return "connect" if my_peer.role == "sender" else "listen"
     elif my_friendly and not other_friendly:
-        # Ich friendly, Peer complex: Ich liste, Peer scannt
-        return "listen"
+        # Ich friendly, Peer complex: Ich SCANNE die Port-Range des Peers
+        return "scan"
     elif not my_friendly and other_friendly:
-        # Ich complex, Peer friendly: Ich scanne, Peer listet
+        # Ich complex, Peer friendly: Ich SCANNE (Listener läuft parallel)
         return "scan"
     else:
-        # Beide complex: Beide scannen
+        # Beide complex: Beide SCANNEN (Listener läuft parallel)
         return "scan"
