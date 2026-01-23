@@ -114,6 +114,14 @@ async def send_peer_info_for_connection(
     sender_port = sender.bound_ports[conn_num] if conn_num < len(sender.bound_ports) else sender.local_port
     receiver_port = receiver.bound_ports[conn_num] if conn_num < len(receiver.bound_ports) else receiver.local_port
     
+    # FIX: Finde die richtigen NAT-Ports aus probe_ports!
+    sender_nat_port = get_nat_port_for_local_port(sender, sender_port)
+    receiver_nat_port = get_nat_port_for_local_port(receiver, receiver_port)
+    
+    logger.info(f"Session {session_id}: Connection {conn_num} - "
+                f"Sender local={sender_port} nat={sender_nat_port}, "
+                f"Receiver local={receiver_port} nat={receiver_nat_port}")
+    
     # Bestimme Punch-Strategie basierend auf NAT-Typen
     sender_strategy = determine_punch_strategy(sender, receiver)
     receiver_strategy = determine_punch_strategy(receiver, sender)
@@ -128,7 +136,7 @@ async def send_peer_info_for_connection(
     msg_to_sender = {
         'type': 'peer_info',
         'connection_num': conn_num,
-        'peer_public_addr': list(receiver.public_addr),
+        'peer_public_addr': [receiver.public_addr[0], receiver_nat_port],  # FIX: Richtiger NAT-Port!
         'peer_local_port': receiver_port,
         'peer_addresses': receiver_addrs,
         'your_role': 'sender',
@@ -146,7 +154,7 @@ async def send_peer_info_for_connection(
     msg_to_receiver = {
         'type': 'peer_info',
         'connection_num': conn_num,
-        'peer_public_addr': list(sender.public_addr),
+        'peer_public_addr': [sender.public_addr[0], sender_nat_port],  # FIX: Richtiger NAT-Port!
         'peer_local_port': sender_port,
         'peer_addresses': sender_addrs,
         'your_role': 'receiver',
@@ -159,6 +167,21 @@ async def send_peer_info_for_connection(
     
     logger.info(f"Session {session_id}: peer_info sent for connection {conn_num} "
                 f"(sender={sender_strategy}, receiver={receiver_strategy})")
+
+
+def get_nat_port_for_local_port(peer, local_port: int) -> int:
+    """
+    Finde NAT-Port für einen gegebenen lokalen Port aus probe_ports.
+    Fallback: Verwende public_addr Port.
+    """
+    for lport, nport in peer.probe_ports:
+        if lport == local_port:
+            logger.debug(f"Found NAT port {nport} for local port {local_port}")
+            return nport
+    
+    # Fallback: Verwende public_addr Port
+    logger.warning(f"No probe_port found for local {local_port}, using public_addr port {peer.public_addr[1]}")
+    return peer.public_addr[1]
 
 
 def determine_punch_strategy(my_peer, other_peer) -> str:
