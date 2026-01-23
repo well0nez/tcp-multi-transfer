@@ -47,7 +47,7 @@ async fn punch_listen(
     let wait_time = (local_start_at - now).max(0.0);
     
     if wait_time > 0.0 {
-        info!("⏱️ Waiting {:.3}s until synchronized start (LISTEN mode)", wait_time);
+        info!("Waiting {:.3}s until synchronized start (LISTEN mode)", wait_time);
         tokio::time::sleep(Duration::from_secs_f64(wait_time)).await;
     }
     
@@ -58,12 +58,12 @@ async fn punch_listen(
     let listener = TcpListener::from_std(std_listener)?;
     
     let local_addr = listener.local_addr()?;
-    info!("📡 LISTEN mode: Waiting for connection on {}", local_addr);
+    info!("LISTEN mode: Waiting for connection on {}", local_addr);
     
     // Accept mit Timeout
     match tokio::time::timeout(timeout, listener.accept()).await {
         Ok(Ok((mut stream, peer_addr))) => {
-            info!("✅ LISTEN: Accepted connection from {}", peer_addr);
+            info!("LISTEN: Accepted connection from {}", peer_addr);
             stream.set_nodelay(true)?;
             
             // Pre-Handshake
@@ -92,12 +92,12 @@ async fn punch_connect(
     let wait_time = (local_start_at - now).max(0.0);
     
     if wait_time > 0.0 {
-        info!("⏱️ Waiting {:.3}s until synchronized start (CONNECT mode)", wait_time);
+        info!("Waiting {:.3}s until synchronized start (CONNECT mode)", wait_time);
         tokio::time::sleep(Duration::from_secs_f64(wait_time)).await;
     }
     
     let peer_addr = peer_info.peer_addr;
-    info!("🔌 CONNECT mode: Connecting to {}", peer_addr);
+    info!("CONNECT mode: Connecting to {}", peer_addr);
     
     // Direkter Connect
     socket.set_nonblocking(true)?;
@@ -114,7 +114,7 @@ async fn punch_connect(
             }
             
             stream.set_nodelay(true)?;
-            info!("✅ CONNECT: Connected to {}", peer_addr);
+            info!("CONNECT: Connected to {}", peer_addr);
             
             // Pre-Handshake
             if pre_handshake(&mut stream).await.is_ok() {
@@ -144,7 +144,7 @@ async fn punch_scan(
     let wait_time = (local_start_at - now).max(0.0);
     
     if wait_time > 0.0 {
-        info!("⏱️ Waiting {:.3}s until synchronized start (SCAN mode)", wait_time);
+        info!("Waiting {:.3}s until synchronized start (SCAN mode)", wait_time);
         tokio::time::sleep(Duration::from_secs_f64(wait_time)).await;
     }
     
@@ -162,8 +162,6 @@ async fn punch_scan(
         return Err(anyhow!("No peer addresses available"));
     }
     
-    // Listener Setup ZUERST (bevor SCAN-Log!)
-    // CRITICAL: Create NEW socket with all hole punch options (especially SO_REUSEPORT)!
     let local_port = socket.local_addr()?.as_socket().unwrap().port();
     let listener_socket = create_hole_punch_socket()?;
     bind_to_port(&listener_socket, local_port)?;
@@ -172,10 +170,9 @@ async fn punch_scan(
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
     let listener_local_port = listener.local_addr()?.port();
-    info!("📡 Listener ready on port {}", listener_local_port);
+    info!("Listener ready on port {}", listener_local_port);
     
-    // DANN Log: SCAN mode
-    info!("🔍 SCAN mode: Trying {} unique addresses", peer_addresses.len());
+    info!("SCAN mode: Trying {} unique addresses", peer_addresses.len());
     debug!("SCAN: peer_addresses = {:?}", peer_addresses);
     
     // Channel für Kandidaten
@@ -203,7 +200,6 @@ async fn punch_scan(
         }
     });
     
-    // Connector Tasks - EIN TASK PRO PEER_ADDRESS! (PARALLEL!)
     let local_port = listener_local_port;
     let total_addrs = peer_addresses.len();
     let connector_handles: Vec<_> = peer_addresses.into_iter().enumerate().map(|(idx, peer_addr)| {
@@ -227,7 +223,6 @@ async fn punch_scan(
                     }
                 };
                 
-                // CRITICAL: Bind zu unserem local_port!
                 if let Err(e) = bind_to_port(&socket, local_port) {
                     debug!("SCAN[{}]: Failed to bind: {}", idx, e);
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -245,7 +240,7 @@ async fn punch_scan(
                         let std_stream: std::net::TcpStream = socket.into();
                         if let Ok(mut stream) = TcpStream::from_std(std_stream) {
                             if pre_handshake(&mut stream).await.is_ok() {
-                                info!("✅ SCAN: Connected to {} (addr {}/{})", peer_addr, idx + 1, total_addrs);
+                                info!("SCAN: Connected to {} (addr {}/{})", peer_addr, idx + 1, total_addrs);
                                 let _ = connector_tx.send(stream).await;
                                 return;
                             }
@@ -263,7 +258,7 @@ async fn punch_scan(
                             let std_stream: std::net::TcpStream = socket.into();
                             if let Ok(mut stream) = wait_for_connect(std_stream, Duration::from_millis(500)).await {
                                 if pre_handshake(&mut stream).await.is_ok() {
-                                    info!("✅ SCAN: Connected to {} (addr {}/{})", peer_addr, idx + 1, total_addrs);
+                                    info!("SCAN: Connected to {} (addr {}/{})", peer_addr, idx + 1, total_addrs);
                                     let _ = connector_tx.send(stream).await;
                                     return;
                                 }
@@ -363,7 +358,7 @@ async fn punch_scan(
         h.abort();
     }
     
-    info!("✅ SCAN: Best candidate selected (local={}, remote={}) after {:.3}s", 
+    info!("SCAN: Best candidate selected (local={}, remote={}) after {:.3}s", 
           winner.local_port, winner.remote_port, scan_start_time.elapsed().as_secs_f64());
     Ok(winner.stream)
 }
@@ -389,24 +384,10 @@ async fn wait_for_connect(stream: std::net::TcpStream, timeout: Duration) -> Res
     }
 }
 
-/// Helper: Warte auf erfolgreichen Connect
-async fn wait_for_connect_async(stream: &mut TcpStream, timeout: Duration) -> Result<()> {
-    match tokio::time::timeout(timeout, stream.writable()).await {
-        Ok(Ok(_)) => {
-            if stream.peer_addr().is_err() {
-                Err(anyhow!("Connection failed"))
-            } else {
-                Ok(())
-            }
-        }
-        Ok(Err(e)) => Err(anyhow!("Writable error: {}", e)),
-        Err(_) => Err(anyhow!("Timeout")),
-    }
-}
-
 /// Peer-Info für Strategy-basiertes Punching
 pub struct PeerInfo {
     pub peer_addr: SocketAddr,
     pub peer_addresses: Vec<PeerAddressInfo>,
+    #[allow(dead_code)]
     pub peer_nat_analysis: Option<crate::protocol::NATAnalysis>,
 }

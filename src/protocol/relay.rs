@@ -21,10 +21,6 @@ pub struct RegisterMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_connections: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scan_budget: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub punch_overshoot: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_fallback: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_connections: Option<u32>,
@@ -40,8 +36,6 @@ impl RegisterMessage {
         prediction_mode: Option<String>,
         prediction_range_extra_pct: Option<f64>,
         tcp_connections: Option<u32>,
-        scan_budget: Option<u32>,
-        punch_overshoot: Option<f64>,
         allow_fallback: Option<bool>,
         min_connections: Option<u32>,
         extra_ports: Vec<u16>,
@@ -55,8 +49,6 @@ impl RegisterMessage {
             prediction_mode,
             prediction_range_extra_pct,
             tcp_connections,
-            scan_budget,
-            punch_overshoot,
             allow_fallback,
             min_connections,
             extra_ports,
@@ -128,8 +120,10 @@ pub struct PeerAddressInfo {
 pub struct NATAnalysis {
     // Essential fields for client hole punching
     #[serde(default)]
+    #[allow(dead_code)]
     pub scan_start: u16,
     #[serde(default)]
+    #[allow(dead_code)]
     pub scan_end: u16,
     #[serde(default)]
     #[allow(dead_code)]
@@ -159,7 +153,6 @@ pub enum RelayMessage {
         probe_port: Option<u16>,
         #[serde(default)]
         needs_probing: Option<bool>,
-        // NEU: Mehrere Timestamps für Median-Berechnung
         #[serde(default)]
         server_times: Option<Vec<f64>>,
     },
@@ -176,16 +169,11 @@ pub enum RelayMessage {
         #[serde(default)]
         tcp_connections: Option<u32>,
         #[serde(default)]
-        scan_budget: Option<u32>,
-        #[serde(default)]
-        punch_overshoot: Option<f64>,
-        #[serde(default)]
         allow_fallback: Option<bool>,
         #[serde(default)]
         min_connections: Option<u32>,
         #[serde(default)]
         peer_extra_ports: Vec<u16>,
-        // NEU: Multi-Connection Support
         #[serde(default)]
         connection_num: Option<u32>,
         #[serde(default)]
@@ -208,7 +196,6 @@ pub enum RelayMessage {
         #[serde(default)]
         #[allow(dead_code)]
         message: String,
-        // NEU: Multi-Connection Support
         #[serde(default)]
         connection_num: Option<u32>,
     },
@@ -216,6 +203,7 @@ pub enum RelayMessage {
     /// Retry Request: Client will Connection erneut versuchen
     #[serde(rename = "retry_request")]
     RetryRequest {
+        #[allow(dead_code)]
         connection_num: u32,
     },
     

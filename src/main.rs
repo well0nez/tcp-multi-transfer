@@ -18,7 +18,7 @@ mod relay;
 mod connection;
 
 use cli::{Args, Mode, PredictionMode, parse_chunk_size, APP_VERSION};
-use relay::{run_relay_protocol, get_free_port, create_bound_socket, compute_punch_task_count};
+use relay::{run_relay_protocol, get_free_port, create_bound_socket};
 use connection::establish_multi_connections;
 use transfer::{
     TcpSender,
@@ -39,8 +39,6 @@ async fn run_sender(
     prediction_mode: PredictionMode,
     prediction_range_extra_pct: f64,
     tcp_connections: u32,
-    scan_budget: u32,
-    punch_overshoot: f64,
     allow_fallback: bool,
     min_connections: u32,
 ) -> Result<()> {
@@ -52,7 +50,7 @@ async fn run_sender(
     let local_port_base = get_free_port()?;
     info!("Using local port base: {}", local_port_base);
 
-    let punch_tasks = compute_punch_task_count(tcp_connections.max(1) as usize, punch_overshoot);
+    let punch_tasks = tcp_connections.max(1) as usize;
     let mut bound_sockets = Vec::new();
     let mut extra_ports = Vec::new();
     let mut current_port = local_port_base;
@@ -75,18 +73,16 @@ async fn run_sender(
 
     let (relay_stream, mut session) = run_relay_protocol(
         server_addr, session_id, "sender", local_port, timeout, probe_count,
-        prediction_mode, prediction_range_extra_pct, tcp_connections, scan_budget,
-        punch_overshoot, allow_fallback, min_connections, extra_ports, bound_sockets
+        prediction_mode, prediction_range_extra_pct, tcp_connections,
+        allow_fallback, min_connections, extra_ports, bound_sockets
     ).await?;
 
-    // NEU: Split relay stream for Multi-Connection Loop
     let (relay_reader, relay_writer) = relay_stream.into_split();
     let relay_reader = BufReader::new(relay_reader);
 
-    // NEU: Etabliere Connections mit strategie-basiertem Hole Punching
-    let tcp_conns = session.tcp_connections;  // Copy before mutable borrow
-    let srv_addr = session.server_addr;  // Copy before mutable borrow
-    let probe_p = session.probe_port;  // Copy before mutable borrow
+    let tcp_conns = session.tcp_connections;
+    let srv_addr = session.server_addr;
+    let probe_p = session.probe_port;
     let streams = establish_multi_connections(
         relay_reader,
         relay_writer,
@@ -99,7 +95,6 @@ async fn run_sender(
         probe_p,
     ).await?;
 
-    // Validierung der etablierten Connections
     let min_required = if session.allow_fallback { 
         session.min_connections.max(1) as usize 
     } else { 
@@ -114,7 +109,7 @@ async fn run_sender(
         )); 
     }
 
-    for s in &streams { info!("✅ Direct P2P: Local {} Remote {}", s.local_addr()?, s.peer_addr()?); }
+    for s in &streams { info!("Direct P2P: Local {} Remote {}", s.local_addr()?, s.peer_addr()?); }
 
     if session.tcp_connections > 1 || streams.len() > 1 {
         run_multi_sender(streams, file_path, file_size, sha256).await
@@ -133,15 +128,13 @@ async fn run_receiver(
     prediction_mode: PredictionMode,
     prediction_range_extra_pct: f64,
     tcp_connections: u32,
-    scan_budget: u32,
-    punch_overshoot: f64,
     allow_fallback: bool,
     min_connections: u32,
 ) -> Result<()> {
     let local_port_base = get_free_port()?;
     info!("Using local port base: {}", local_port_base);
 
-    let punch_tasks = compute_punch_task_count(tcp_connections.max(1) as usize, punch_overshoot);
+    let punch_tasks = tcp_connections.max(1) as usize;
     let mut bound_sockets = Vec::new();
     let mut extra_ports = Vec::new();
     let mut current_port = local_port_base;
@@ -164,18 +157,16 @@ async fn run_receiver(
 
     let (relay_stream, mut session) = run_relay_protocol(
         server_addr, session_id, "receiver", local_port, timeout, probe_count,
-        prediction_mode, prediction_range_extra_pct, tcp_connections, scan_budget,
-        punch_overshoot, allow_fallback, min_connections, extra_ports, bound_sockets
+        prediction_mode, prediction_range_extra_pct, tcp_connections,
+        allow_fallback, min_connections, extra_ports, bound_sockets
     ).await?;
 
-    // NEU: Split relay stream for Multi-Connection Loop
     let (relay_reader, relay_writer) = relay_stream.into_split();
     let relay_reader = BufReader::new(relay_reader);
 
-    // NEU: Etabliere Connections mit strategie-basiertem Hole Punching
-    let tcp_conns = session.tcp_connections;  // Copy before mutable borrow
-    let srv_addr = session.server_addr;  // Copy before mutable borrow
-    let probe_p = session.probe_port;  // Copy before mutable borrow
+    let tcp_conns = session.tcp_connections;
+    let srv_addr = session.server_addr;
+    let probe_p = session.probe_port;
     let streams = establish_multi_connections(
         relay_reader,
         relay_writer,
@@ -188,7 +179,6 @@ async fn run_receiver(
         probe_p,
     ).await?;
 
-    // Validierung der etablierten Connections
     let min_required = if session.allow_fallback { 
         session.min_connections.max(1) as usize 
     } else { 
@@ -203,7 +193,7 @@ async fn run_receiver(
         )); 
     }
 
-    for s in &streams { info!("✅ Direct P2P: Local {} Remote {}", s.local_addr()?, s.peer_addr()?); }
+    for s in &streams { info!("Direct P2P: Local {} Remote {}", s.local_addr()?, s.peer_addr()?); }
 
     if session.tcp_connections > 1 || streams.len() > 1 {
         run_multi_receiver(streams).await
@@ -217,7 +207,6 @@ async fn run_receiver(
 async fn run_probe_debug(server_addr: &str, session_id: &str, count: u32) -> Result<()> {
     let probe_addr = relay::resolve_socket_addr(server_addr)?;
     println!("PROBE DEBUG MODE: {} -> {}", server_addr, probe_addr);
-    // Simple mock logic for cleanup
     let _ = session_id;
     let _ = count;
     Ok(())
@@ -244,7 +233,7 @@ async fn main() -> Result<()> {
     
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        error!("🛑 Ctrl+C received, exiting...");
+        error!("Ctrl+C received, exiting...");
         std::process::exit(1);
     });
 
@@ -256,7 +245,7 @@ async fn main() -> Result<()> {
             run_sender(
                 &args.server, &args.session_id, file_path, timeout, args.probe_count,
                 args.prediction_mode, args.prediction_range_extra_pct, args.tcp_connections as u32,
-                args.scan_budget, args.punch_overshoot, args.allow_fallback, args.min_connections
+                args.allow_fallback, args.min_connections
             ).await
         }
         Mode::Receive => {
@@ -264,7 +253,7 @@ async fn main() -> Result<()> {
             run_receiver(
                 &args.server, &args.session_id, timeout, args.probe_count,
                 args.prediction_mode, args.prediction_range_extra_pct, args.tcp_connections as u32,
-                args.scan_budget, args.punch_overshoot, args.allow_fallback, args.min_connections
+                args.allow_fallback, args.min_connections
             ).await
         }
     }

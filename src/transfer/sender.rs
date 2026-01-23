@@ -170,7 +170,7 @@ impl TcpSender {
         
         let elapsed = start.elapsed();
         let speed_mbps = (self.file_size as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
-        progress.finish_with_message(format!("✅ Transfer complete! ({:.1} MB/s)", speed_mbps));
+        progress.finish_with_message(format!("Transfer complete! ({:.1} MB/s)", speed_mbps));
         info!("Transfer complete: {:.2} MB in {:.1}s ({:.1} MB/s)", self.file_size as f64 / 1048576.0, elapsed.as_secs_f64(), speed_mbps);
         Ok(())
     }
@@ -249,7 +249,7 @@ pub async fn run_multi_sender(
     read_exact_timeout(&mut done_stream, &mut ack_buf, Duration::from_secs(120)).await?;
     if ack_buf[0] != MessageType::Ack as u8 { return Err(anyhow!("Expected final ACK")); }
     
-    progress.finish_with_message("✅ Transfer complete!".to_string());
+    progress.finish_with_message("Transfer complete!".to_string());
     Ok(())
 }
 

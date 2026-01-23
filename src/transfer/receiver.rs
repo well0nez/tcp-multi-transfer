@@ -191,13 +191,13 @@ impl TcpReceiver {
             let stream = self.stream.as_mut().unwrap();
             write_all_timeout(stream, &ack, HANDSHAKE_TIMEOUT).await?;
             let speed_mbps = (file_info.file_size as f64 / 1048576.0) / start.elapsed().as_secs_f64();
-            progress_bar.finish_with_message(format!("✅ Complete! ({:.1} MB/s)", speed_mbps));
+            progress_bar.finish_with_message(format!("Complete! ({:.1} MB/s)", speed_mbps));
             info!("File saved: {}", file_info.filename);
             Ok(())
         } else {
             tokio::fs::remove_file(&temp_path).await.ok();
             tracing::error!("SHA256 mismatch!");
-            progress_bar.finish_with_message("❌ SHA256 verification failed!".to_string());
+            progress_bar.finish_with_message("SHA256 verification failed!".to_string());
             Err(anyhow!("SHA256 verification failed"))
         }
     }
@@ -288,7 +288,7 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
     let calculated_hash = sha256_file(Path::new(&temp_path)).await?;
     if calculated_hash == file_info.sha256 {
         tokio::fs::rename(&temp_path, &file_info.filename).await?;
-        progress_bar.finish_with_message("✅ Complete!".to_string());
+        progress_bar.finish_with_message("Complete!".to_string());
         Ok(())
     } else {
         Err(anyhow!("SHA256 mismatch"))

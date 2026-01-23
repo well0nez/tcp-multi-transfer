@@ -78,13 +78,6 @@ pub struct Args {
     /// Maximum number of sequential punch attempts
     #[arg(long, default_value_t = 20, help_heading = "Multi-TCP")]
     pub max_attempts: u32,
-    
-    // DEPRECATED: Kept for backward compatibility, not used anymore
-    #[arg(long, default_value_t = 1024, help_heading = "Multi-TCP", hide = true)]
-    pub scan_budget: u32,
-    
-    #[arg(long, default_value_t = 2.0, help_heading = "Multi-TCP", hide = true)]
-    pub punch_overshoot: f64,
 
     /// Allow fallback to fewer connections if punch fails
     #[arg(long, default_value_t = false, help_heading = "Multi-TCP")]

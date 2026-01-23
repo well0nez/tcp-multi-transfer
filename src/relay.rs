@@ -26,8 +26,6 @@ pub struct Session {
     
     // Multi-TCP fields
     pub tcp_connections: u32,
-    pub scan_budget: u32,
-    pub punch_overshoot: f64,
     pub allow_fallback: bool,
     pub min_connections: u32,
     pub bound_sockets: Vec<Socket>,
@@ -63,7 +61,7 @@ pub fn resolve_socket_addr(input: &str) -> Result<SocketAddr> {
 }
 
 async fn do_nat_probing(probe_addr: SocketAddr, session_id: &str, count: u32) -> Result<()> {
-    info!("🔍 Starting NAT probing ({} connections to {})...", count, probe_addr);
+    info!("Starting NAT probing ({} connections to {})...", count, probe_addr);
     let mut successful = 0;
     for i in 0..count {
         match TcpStream::connect(probe_addr).await {
@@ -82,81 +80,11 @@ async fn do_nat_probing(probe_addr: SocketAddr, session_id: &str, count: u32) ->
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     if successful >= 5 {
-        info!("  ✓ Sent {}/{} probes successfully", successful, count);
+        info!("  Sent {}/{} probes successfully", successful, count);
     } else {
-        warn!("  ⚠️ Only {}/{} probes succeeded", successful, count);
+        warn!("  Only {}/{} probes succeeded", successful, count);
     }
     Ok(())
-}
-
-/// Probe new ports that were bound for multi-connection support
-/// This ensures NAT mappings are established before use
-pub async fn probe_new_ports(
-    probe_addr: SocketAddr,
-    session_id: &str,
-    new_ports: &[u16],
-    probes_per_port: u32,
-) -> Result<()> {
-    if new_ports.is_empty() {
-        return Ok(());
-    }
-    
-    info!("🔍 Probing {} new ports ({} probes each)...", new_ports.len(), probes_per_port);
-    
-    let mut total_successful = 0;
-    let mut total_attempts = 0;
-    
-    for &local_port in new_ports {
-        debug!("  Probing port {}...", local_port);
-        
-        // FIX: Create NEW socket for EACH probe (like do_nat_probing does)
-        for probe_num in 0..probes_per_port {
-            total_attempts += 1;
-            
-            // Create fresh socket for this probe
-            let socket = match create_bound_socket(local_port) {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("    Probe {}/{} for port {} - socket binding failed: {}", probe_num + 1, probes_per_port, local_port, e);
-                    continue;
-                }
-            };
-            
-            socket.set_nonblocking(true)?;
-            let _ = socket.connect(&probe_addr.into());
-            
-            let std_stream: std::net::TcpStream = socket.into();
-            match TcpStream::from_std(std_stream) {
-                Ok(stream) => {
-                    // Wait for connection to be writable
-                    if stream.writable().await.is_ok() {
-                        let probe = ProbeMessage::new(session_id, local_port, probe_num);
-                        let msg = serde_json::to_string(&probe).unwrap_or_default() + "\n";
-                        
-                        let (_, mut writer) = stream.into_split();
-                        if tokio::io::AsyncWriteExt::write_all(&mut writer, msg.as_bytes()).await.is_ok() {
-                            total_successful += 1;
-                            debug!("    Probe {}/{} for port {} succeeded", probe_num + 1, probes_per_port, local_port);
-                        }
-                    }
-                }
-                Err(e) => debug!("    Probe {}/{} for port {} failed: {}", probe_num + 1, probes_per_port, local_port, e),
-            }
-            
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-    
-    let expected = new_ports.len() as u32 * probes_per_port;
-    // Accept if at least 40% of probes succeeded (more lenient threshold)
-    let min_required = (expected * 2) / 5;  // 40% = 2/5
-    if total_successful >= min_required {
-        info!("  ✓ Sent {}/{} probes successfully for new ports", total_successful, total_attempts);
-        Ok(())
-    } else {
-        warn!("  ⚠️ Only {}/{} probes succeeded for new ports (need {})", total_successful, total_attempts, min_required);
-        Err(anyhow!("Insufficient successful probes: {}/{} (need {})", total_successful, expected, min_required))
-    }
 }
 
 pub fn get_free_port() -> Result<u16> {
@@ -179,11 +107,6 @@ pub fn create_bound_socket(local_port: u16) -> Result<Socket> {
     Ok(socket)
 }
 
-pub fn compute_punch_task_count(desired: usize, overshoot: f64) -> usize {
-    let overshoot = if overshoot < 1.0 { 1.0 } else { overshoot };
-    let count = (desired as f64 * overshoot).ceil() as usize;
-    count.max(desired).max(1)
-}
 
 /// Connect to relay server and handle the full protocol
 pub async fn run_relay_protocol(
@@ -196,8 +119,6 @@ pub async fn run_relay_protocol(
     prediction_mode: PredictionMode,
     prediction_range_extra_pct: f64,
     tcp_connections: u32,
-    scan_budget: u32,
-    punch_overshoot: f64,
     allow_fallback: bool,
     min_connections: u32,
     extra_ports: Vec<u16>,
@@ -206,8 +127,6 @@ pub async fn run_relay_protocol(
     info!("Connecting to relay server: {}", server_addr);
     let server_sock_addr = resolve_socket_addr(server_addr)?;
     
-    // CRITICAL: Relay connection MUST use the SAME local_port as hole punching!
-    // Otherwise NAT mapping will be wrong and punching will fail.
     let socket = create_bound_socket(local_port)?;
     socket.set_nonblocking(true)?;
     
@@ -233,8 +152,6 @@ pub async fn run_relay_protocol(
         Some(prediction_mode.as_str().to_string()),
         Some(prediction_range_extra_pct),
         tcp_connections_payload,
-        Some(scan_budget),
-        Some(punch_overshoot),
         Some(allow_fallback),
         Some(min_connections),
         extra_ports,
@@ -257,8 +174,6 @@ pub async fn run_relay_protocol(
         our_delta: 0,
         port_preserved: true,
         tcp_connections,
-        scan_budget,
-        punch_overshoot,
         allow_fallback,
         min_connections,
         bound_sockets,
@@ -284,9 +199,8 @@ pub async fn run_relay_protocol(
                     session.our_delta = port as i32 - local_port as i32;
                     session.port_preserved = session.our_delta == 0;
                     session.probe_port = probe_port;  // Store for later use
-                    info!("✓ Registered! Public address: {}:{}", ip, port);
+                    info!("Registered! Public address: {}:{}", ip, port);
                     
-                    // NEW: Robust time synchronization using median of multiple samples
                     if let Some(times) = server_times {
                         // Collect offsets from all timestamp samples
                         let mut offsets = Vec::new();
@@ -303,7 +217,7 @@ pub async fn run_relay_protocol(
                         offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         session.time_offset = offsets[offsets.len() / 2];
                         
-                        info!("⏱️ Clock offset (median of {} samples): {:.3}s", offsets.len(), session.time_offset);
+                        info!("Clock offset (median of {} samples): {:.3}s", offsets.len(), session.time_offset);
                         info!("   Range: {:.3}s to {:.3}s (spread: {:.3}s)", 
                               offsets.first().unwrap_or(&0.0),
                               offsets.last().unwrap_or(&0.0),
@@ -316,9 +230,9 @@ pub async fn run_relay_protocol(
                             .as_secs_f64();
                         let rtt = now - register_sent_at;
                         session.time_offset = srv_time - (register_sent_at + rtt / 2.0);
-                        warn!("⚠️ Using legacy RTT/2 time sync (offset: {:.3}s) - server should send server_times array", session.time_offset);
+                        warn!("Using legacy RTT/2 time sync (offset: {:.3}s) - server should send server_times array", session.time_offset);
                     } else {
-                        warn!("⚠️ No time sync data received from server - synchronization may be inaccurate");
+                        warn!("No time sync data received from server - synchronization may be inaccurate");
                         session.time_offset = 0.0;
                     }
                     
@@ -332,18 +246,14 @@ pub async fn run_relay_protocol(
                     let probes_complete_msg = r#"{"type":"probes_complete"}"#.to_string() + "\n";
                     writer.write_all(probes_complete_msg.as_bytes()).await?;
                     writer.flush().await?;
-                    info!("✓ Probes complete sent");
+                    info!("Probes complete sent");
                     
-                    // NEU: Return AFTER probes_complete - Multi-Connection Loop handles rest
                     let stream = reader.into_inner().reunite(writer)?;
                     return Ok((stream, session));
                 }
             }
             
-            // OLD PROTOCOL: PeerInfo during registration (DEPRECATED - should not be used with new multi-connection protocol)
-            // This handler is kept for backward compatibility with single-connection mode only.
-            // Multi-connection mode uses the new protocol: Registered → return → Multi-Connection Loop handles everything
-            RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, same_network, peer_nat_analysis, tcp_connections, scan_budget, punch_overshoot, allow_fallback, min_connections, peer_extra_ports, .. } => {
+            RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, same_network, peer_nat_analysis, tcp_connections, allow_fallback, min_connections, peer_extra_ports, .. } => {
                 if let Some((ip, port)) = RelayMessage::parse_addr(&peer_public_addr) {
                     let addr: SocketAddr = format!("{}:{}", ip, port).parse()?;
                     session.peer_public_addr = Some(addr);
@@ -352,24 +262,16 @@ pub async fn run_relay_protocol(
                     session.peer_nat_analysis = peer_nat_analysis;
                     
                     session.tcp_connections = tcp_connections.unwrap_or(session.tcp_connections);
-                    session.scan_budget = scan_budget.unwrap_or(session.scan_budget);
-                    session.punch_overshoot = punch_overshoot.unwrap_or(session.punch_overshoot);
                     session.allow_fallback = allow_fallback.unwrap_or(session.allow_fallback);
                     session.min_connections = min_connections.unwrap_or(session.min_connections);
                     session.peer_extra_ports = peer_extra_ports;
                     
-                    info!("✓ Peer info received! Peer: {} (local {})", addr, peer_local_port);
+                    info!("Peer info received! Peer: {} (local {})", addr, peer_local_port);
                     
-                    // REMOVED: Old Dynamic Port Binding for Receiver logic
-                    // This caused out-of-order messages (ports_added_ack arriving before peer_info in multi-connection loop)
-                    // New protocol: Sockets are bound on-demand in establish_multi_connections()
-                    // Retry: Sockets are bound when needed after retry_granted
-                    
-                    // Only send READY for backward compatibility with old single-connection protocol
                     let msg = r#"{"type":"ready"}"#.to_string() + "\n";
                     writer.write_all(msg.as_bytes()).await?;
                     writer.flush().await?;
-                    info!("✓ READY sent, waiting for GO...");
+                    info!("READY sent, waiting for GO...");
                 }
             }
             
@@ -383,8 +285,6 @@ pub async fn run_relay_protocol(
                 debug!("Received PortsAddedAck in registration phase - should be handled in multi-connection loop");
             }
             
-            // NEU: Go-Messages werden nun im Multi-Connection Loop behandelt
-            // (nach probes_complete returnen wir und der Loop übernimmt)
             RelayMessage::Go { .. } => {
                 warn!("Received GO in registration phase - should be handled in multi-connection loop");
             }
