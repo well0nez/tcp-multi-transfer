@@ -163,7 +163,10 @@ async fn punch_scan(
     }
     
     // Listener Setup ZUERST (bevor SCAN-Log!)
-    let listener_socket = socket.try_clone()?;
+    // CRITICAL: Create NEW socket with all hole punch options (especially SO_REUSEPORT)!
+    let local_port = socket.local_addr()?.as_socket().unwrap().port();
+    let listener_socket = create_hole_punch_socket()?;
+    bind_to_port(&listener_socket, local_port)?;
     listener_socket.listen(128)?;
     let std_listener: std::net::TcpListener = listener_socket.into();
     std_listener.set_nonblocking(true)?;
@@ -280,28 +283,89 @@ async fn punch_scan(
     
     drop(tx);
     
-    // Warte auf ersten erfolgreichen Stream
+    // Grace Window für optimale Kandidatenauswahl (wie im Original)
+    const GRACE_WINDOW: Duration = Duration::from_millis(300);
+    
+    // Struktur für Kandidaten mit Port-Info
+    struct Candidate {
+        stream: TcpStream,
+        local_port: u16,
+        remote_port: u16,
+    }
+    
+    // Helper-Funktion für Kandidaten-Auswahl (deterministisch)
+    fn candidate_key(local_port: u16, remote_port: u16) -> (u16, u16) {
+        if local_port <= remote_port {
+            (local_port, remote_port)
+        } else {
+            (remote_port, local_port)
+        }
+    }
+    
     let scan_start_time = tokio::time::Instant::now();
     let timeout_duration = timeout + Duration::from_secs(1);
     
-    match tokio::time::timeout(timeout_duration, rx.recv()).await {
+    // Warte auf ersten Kandidaten
+    let first = match tokio::time::timeout(timeout_duration, rx.recv()).await {
         Ok(Some(stream)) => {
+            let local_port = stream.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+            let remote_port = stream.peer_addr().ok().map(|a| a.port()).unwrap_or(0);
+            debug!("First candidate: local={}, remote={}", local_port, remote_port);
+            Candidate { stream, local_port, remote_port }
+        }
+        Ok(None) => {
             listener_handle.abort();
             for h in connector_handles {
                 h.abort();
             }
-            info!("✅ SCAN: Connection established after {:.3}s", scan_start_time.elapsed().as_secs_f64());
-            Ok(stream)
+            return Err(anyhow!("SCAN timeout - no candidates"));
         }
-        _ => {
+        Err(_) => {
             listener_handle.abort();
             for h in connector_handles {
                 h.abort();
             }
             let elapsed = scan_start_time.elapsed().as_secs_f64();
-            Err(anyhow!("SCAN timeout after {:.1}s (configured: {:?})", elapsed, timeout))
+            return Err(anyhow!("SCAN timeout after {:.1}s (configured: {:?})", elapsed, timeout));
+        }
+    };
+    
+    // Warte 300ms auf weitere Kandidaten und wähle den besten
+    let mut winner = first;
+    let mut winner_key = candidate_key(winner.local_port, winner.remote_port);
+    let grace_until = tokio::time::Instant::now() + GRACE_WINDOW;
+    
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= grace_until {
+            break;
+        }
+        let remaining = grace_until - now;
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(stream)) => {
+                let local_port = stream.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+                let remote_port = stream.peer_addr().ok().map(|a| a.port()).unwrap_or(0);
+                let key = candidate_key(local_port, remote_port);
+                if key < winner_key {
+                    debug!("Found better candidate: {:?} < {:?}", key, winner_key);
+                    winner = Candidate { stream, local_port, remote_port };
+                    winner_key = key;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
         }
     }
+    
+    // Cleanup
+    listener_handle.abort();
+    for h in connector_handles {
+        h.abort();
+    }
+    
+    info!("✅ SCAN: Best candidate selected (local={}, remote={}) after {:.3}s", 
+          winner.local_port, winner.remote_port, scan_start_time.elapsed().as_secs_f64());
+    Ok(winner.stream)
 }
 
 /// Helper: Warte auf erfolgreichen Connect (für non-blocking sockets)

@@ -149,8 +149,9 @@ async fn run_relay_protocol(
     info!("Connecting to relay server: {}", server_addr);
     let server_sock_addr = resolve_socket_addr(server_addr)?;
     
-    // Use a SEPARATE socket for relay connection - don't consume bound_sockets!
-    let socket = create_bound_socket(0).or_else(|_| create_bound_socket(local_port))?;
+    // CRITICAL: Relay connection MUST use the SAME local_port as hole punching!
+    // Otherwise NAT mapping will be wrong and punching will fail.
+    let socket = create_bound_socket(local_port)?;
     socket.set_nonblocking(true)?;
     
     let _ = socket.connect(&SockAddr::from(server_sock_addr));
