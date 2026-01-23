@@ -383,12 +383,12 @@ struct GoSignal {
 async fn receive_peer_info_for_connection(
     relay_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     expected_conn_num: u32,
-) -> Result<(PeerInfo, String)> {
+) -> Result<(PeerInfo, String, u32)> {
     loop {
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(120), relay_reader.read_line(&mut line))
             .await
-            .map_err(|_| anyhow!("Timeout waiting for peer_info (120s)"))??;
+            .map_err(|_| anyhow!("Timeout waiting for peer_info (120s)"))?;
         
         if line.trim().is_empty() {
             return Err(anyhow!("Empty line from relay server"));
@@ -398,7 +398,7 @@ async fn receive_peer_info_for_connection(
             .map_err(|e| anyhow!("Failed to parse relay message: {} - {}", e, line.trim()))?;
         
         match msg {
-            RelayMessage::PeerInfo { connection_num, punch_strategy, peer_public_addr, peer_addresses, peer_nat_analysis, .. } => {
+            RelayMessage::PeerInfo { connection_num, punch_strategy, peer_public_addr, peer_addresses, peer_nat_analysis, tcp_connections, .. } => {
                 let conn = connection_num.unwrap_or(0);
                 if conn != expected_conn_num {
                     warn!("Received peer_info for conn {} but expected {}, skipping", conn, expected_conn_num);
@@ -406,6 +406,7 @@ async fn receive_peer_info_for_connection(
                 }
                 
                 let strategy = punch_strategy.unwrap_or_else(|| "scan".to_string());
+                let peer_tcp_connections = tcp_connections.unwrap_or(1);  // Default: 1 Connection
                 
                 // Baue PeerInfo-Struct
                 let peer_addr = RelayMessage::parse_addr(&peer_public_addr)
@@ -418,7 +419,7 @@ async fn receive_peer_info_for_connection(
                     peer_nat_analysis,
                 };
                 
-                return Ok((peer_info, strategy));
+                return Ok((peer_info, strategy, peer_tcp_connections));
             }
             RelayMessage::Error { message } => {
                 return Err(anyhow!("Server error: {}", message));
@@ -473,7 +474,7 @@ async fn receive_go_for_connection(
 async fn establish_multi_connections(
     mut relay_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
     mut relay_writer: tokio::net::tcp::OwnedWriteHalf,
-    session: &Session,
+    session: &mut Session,
     tcp_connections: u32,
     timeout: Duration,
 ) -> Result<Vec<TcpStream>> {
@@ -481,12 +482,16 @@ async fn establish_multi_connections(
     let mut failures_in_a_row = 0;
     const MAX_FAILURES: u32 = 5;
     
-    for conn_num in 0..tcp_connections {
-        info!("📡 Waiting for peer_info for connection {}/{}...", conn_num + 1, tcp_connections);
+    // CRITICAL: Für den Receiver - lese tcp_connections aus der ERSTEN peer_info!
+    // Der Sender bestimmt, wie viele Connections genutzt werden.
+    let mut actual_tcp_connections = tcp_connections;
+    
+    for conn_num in 0..actual_tcp_connections {
+        info!("📡 Waiting for peer_info for connection {}/{}...", conn_num + 1, actual_tcp_connections);
         
         loop {  // Retry-Loop für diese Connection
             // 1. Warte auf peer_info für diese Connection
-            let (peer_info, punch_strategy) = match receive_peer_info_for_connection(
+            let (peer_info, punch_strategy, peer_tcp_connections) = match receive_peer_info_for_connection(
                 &mut relay_reader,
                 conn_num
             ).await {
@@ -500,6 +505,44 @@ async fn establish_multi_connections(
                     continue;
                 }
             };
+            
+            // CRITICAL: Bei der ERSTEN peer_info - übernehme tcp_connections vom Peer (Sender bestimmt!)
+            if conn_num == 0 && peer_tcp_connections > actual_tcp_connections {
+                info!("🔄 Peer wants {} connections, we only prepared {}. Binding more sockets...", 
+                      peer_tcp_connections, actual_tcp_connections);
+                
+                let needed_more = (peer_tcp_connections - actual_tcp_connections) as usize;
+                let next_port = if let Some(last) = session.bound_sockets.last() {
+                    last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
+                } else {
+                    0
+                };
+                
+                if next_port > 0 {
+                    let mut added_count = 0;
+                    let mut attempt_counter = 0;
+                    let mut current_port = next_port;
+                    
+                    while added_count < needed_more && attempt_counter < 100 {
+                        match create_bound_socket(current_port) {
+                            Ok(s) => {
+                                session.bound_sockets.push(s);
+                                added_count += 1;
+                                debug!("Bound extra socket on port {}", current_port);
+                            },
+                            Err(_) => {}
+                        }
+                        current_port = current_port.wrapping_add(1);
+                        attempt_counter += 1;
+                    }
+                    
+                    info!("✓ Bound {} additional sockets (total: {})", added_count, session.bound_sockets.len());
+                }
+                
+                // Update the actual connection count
+                actual_tcp_connections = peer_tcp_connections;
+                info!("✓ Adjusted to {} connections as requested by peer", actual_tcp_connections);
+            }
             
             info!("✓ Received peer_info for connection {}: strategy={}", conn_num + 1, punch_strategy);
             

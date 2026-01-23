@@ -135,12 +135,14 @@ async def send_peer_info_for_connection(
         'same_network': False,
         'peer_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None,
         'punch_strategy': sender_strategy,
+        'tcp_connections': sender.tcp_connections,  # Sender weiß schon, wie viele er will
     }
     await send_message(sender.writer, msg_to_sender)
     
     # Sende an Receiver
     # peer_nat_analysis = NAT-Analyse des PEERS (Port-Range zum Scannen)
     # Der Receiver scannt die Port-Range des Senders
+    # WICHTIG: Sende die tcp_connections des SENDERS, damit Receiver weiß, wie viele Connections nötig sind!
     msg_to_receiver = {
         'type': 'peer_info',
         'connection_num': conn_num,
@@ -151,6 +153,7 @@ async def send_peer_info_for_connection(
         'same_network': False,
         'peer_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None,
         'punch_strategy': receiver_strategy,
+        'tcp_connections': sender.tcp_connections,  # ← CRITICAL: Receiver muss wissen, wie viele Connections der Sender will!
     }
     await send_message(receiver.writer, msg_to_receiver)
     
