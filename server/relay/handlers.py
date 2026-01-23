@@ -11,7 +11,6 @@ from typing import List
 from ..models import Peer, NATAnalysis
 from ..nat_analyzer import analyze_nat
 from .utils import send_message
-from .coordinator import try_send_peer_info
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +62,6 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
     if not peer.needs_probing:
         peer.probes_done = True
         logger.info(f"Peer {peer.role} probes_done=True (no probing required)")
-        await try_send_peer_info(session_id, session_manager, max_scan_ports)
         return
     
     if session_id in session_manager.pending_probes:
@@ -107,8 +105,6 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
     
     peer.probes_done = True
     logger.info(f"Peer {peer.role} probes_done=True")
-    
-    await try_send_peer_info(session_id, session_manager, max_scan_ports)
     
     # NEU: Starte Multi-Connection Koordination wenn beide ready
     lock = session_manager.get_session_lock(session_id)
