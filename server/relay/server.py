@@ -11,7 +11,6 @@ from ..models import Peer, NATAnalysis
 from ..session_manager import SessionManager
 from .utils import send_message, send_error
 from .handlers import wait_for_peer_messages
-from .coordinator import try_start_session
 
 logger = logging.getLogger(__name__)
 
@@ -220,10 +219,7 @@ class TCPRelayServerICE:
             
             logger.info(f"Peer {role}: port_preserved={port_preserved}, needs_probing={peer.needs_probing}")
             
-            # Try to start session
-            await try_start_session(session_id, self.session_manager, self.max_scan_ports)
-            
-            # Wait for messages
+            # Wait for messages (coordination happens in handle_probes_complete)
             await wait_for_peer_messages(peer, self.session_manager, self.max_scan_ports)
         
         except asyncio.TimeoutError:
