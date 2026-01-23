@@ -340,10 +340,12 @@ pub async fn run_relay_protocol(
                 }
             }
             
-            // OLD PROTOCOL HANDLING (kept for backward compatibility, but should not be reached with new server)
+            // OLD PROTOCOL: PeerInfo during registration (DEPRECATED - should not be used with new multi-connection protocol)
+            // This handler is kept for backward compatibility with single-connection mode only.
+            // Multi-connection mode uses the new protocol: Registered → return → Multi-Connection Loop handles everything
             RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, same_network, peer_nat_analysis, tcp_connections, scan_budget, punch_overshoot, allow_fallback, min_connections, peer_extra_ports, .. } => {
                 if let Some((ip, port)) = RelayMessage::parse_addr(&peer_public_addr) {
-                    let addr: SocketAddr = format!("{}:{}", ip, port).parse()?;
+                    let addr: SocketAddr = format!(\"{}:{}\", ip, port).parse()?;
                     session.peer_public_addr = Some(addr);
                     session.peer_addresses = peer_addresses;
                     session.same_network = same_network;
@@ -356,57 +358,18 @@ pub async fn run_relay_protocol(
                     session.min_connections = min_connections.unwrap_or(session.min_connections);
                     session.peer_extra_ports = peer_extra_ports;
                     
-                    info!("✓ Peer info received! Peer: {} (local {})", addr, peer_local_port);
+                    info!(\"✓ Peer info received! Peer: {} (local {})\", addr, peer_local_port);
                     
-                    // Dynamic Port Binding for Receiver
-                    if role == "receiver" {
-                        let desired = session.tcp_connections.max(1) as usize;
-                        let current_count = session.bound_sockets.len();
-                        let overshoot = session.punch_overshoot.max(1.0);
-                        let needed_count = compute_punch_task_count(desired, overshoot);
-                        
-                        if current_count < needed_count {
-                            let needed_more = needed_count - current_count;
-                            info!("Sender wants {} connections. Have {}. Binding {} more...", desired, current_count, needed_more);
-                            
-                            let next_port = if let Some(last) = session.bound_sockets.last() {
-                                last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
-                            } else { 0 };
-                            
-                            if next_port > 0 {
-                                let mut new_ports = Vec::new();
-                                let mut added_count = 0;
-                                let mut attempt_counter = 0;
-                                let mut current_cand = next_port;
-                                
-                                while added_count < needed_more && attempt_counter < 100 {
-                                    match create_bound_socket(current_cand) {
-                                        Ok(s) => {
-                                            new_ports.push(current_cand);
-                                            session.bound_sockets.push(s);
-                                            added_count += 1;
-                                        },
-                                        Err(_) => {}
-                                    }
-                                    current_cand = current_cand.wrapping_add(1);
-                                    attempt_counter += 1;
-                                }
-                                
-                                if !new_ports.is_empty() {
-                                    info!("Bound {} extra ports: {:?}", new_ports.len(), new_ports);
-                                    let add_msg = AddPortsMessage::new(session_id, new_ports);
-                                    let json = serde_json::to_string(&add_msg)? + "\n";
-                                    writer.write_all(json.as_bytes()).await?;
-                                    writer.flush().await?;
-                                }
-                            }
-                        }
-                    }
+                    // REMOVED: Old "Dynamic Port Binding for Receiver" logic
+                    // This caused "out of order" messages (ports_added_ack arriving before peer_info in multi-connection loop)
+                    // New protocol: Sockets are bound on-demand in establish_multi_connections()
+                    // Retry: Sockets are bound when needed after retry_granted
                     
-                    let msg = r#"{"type":"ready"}"#.to_string() + "\n";
+                    // Only send READY for backward compatibility with old single-connection protocol
+                    let msg = r#\"{\"type\":\"ready\"}\"#.to_string() + \"\\n\";
                     writer.write_all(msg.as_bytes()).await?;
                     writer.flush().await?;
-                    info!("✓ READY sent, waiting for GO...");
+                    info!(\"✓ READY sent, waiting for GO...\");
                 }
             }
             
