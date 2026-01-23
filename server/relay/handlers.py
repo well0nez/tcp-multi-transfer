@@ -49,6 +49,10 @@ async def wait_for_peer_messages(peer: Peer, session_manager, max_scan_ports: in
                 logger.info(f"Peer {peer.role} sent probes_complete")
                 await handle_probes_complete(peer, session_manager, max_scan_ports)
             
+            elif msg_type == 'retry_request':
+                logger.info(f"Peer {peer.role} sent retry_request")
+                await handle_retry_request(msg, peer, session_manager)
+            
         except asyncio.TimeoutError:
             try:
                 await send_message(peer.writer, {'type': 'ping'})
@@ -201,3 +205,70 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
                         max_scan_ports
                     )
                 )
+
+
+async def handle_retry_request(msg: dict, peer: Peer, session_manager):
+    """Handle retry_request from client (wants to retry a failed connection with new ports)"""
+    conn_num = msg.get('connection_num')
+    if conn_num is None:
+        logger.warning(f"Received retry_request with no connection_num from {peer.role}")
+        return
+    
+    session_id = peer.session_id
+    
+    logger.info(f"Peer {peer.role} requests retry for connection {conn_num}")
+    
+    # Markiere, dass dieser Peer einen Retry will
+    if not hasattr(peer, 'retry_requested'):
+        peer.retry_requested = {}
+    peer.retry_requested[conn_num] = True
+    
+    # Prüfe ob BEIDE Peers retry wollen
+    lock = session_manager.get_session_lock(session_id)
+    async with lock:
+        session = session_manager.sessions.get(session_id)
+        if not session:
+            logger.error(f"Session {session_id} not found for retry_request")
+            return
+        
+        sender = session.get('sender')
+        receiver = session.get('receiver')
+        
+        if not sender or not receiver:
+            logger.error(f"Session {session_id}: Missing sender or receiver for retry_request")
+            return
+        
+        # Initialisiere retry_requested falls nicht vorhanden
+        if not hasattr(sender, 'retry_requested'):
+            sender.retry_requested = {}
+        if not hasattr(receiver, 'retry_requested'):
+            receiver.retry_requested = {}
+        
+        # Prüfe ob BEIDE wollen
+        if sender.retry_requested.get(conn_num) and receiver.retry_requested.get(conn_num):
+            logger.info(f"Session {session_id}: Both peers want retry for connection {conn_num} - granting!")
+            
+            # Sende retry_granted an BEIDE
+            await send_message(sender.writer, {
+                'type': 'retry_granted',
+                'connection_num': conn_num
+            })
+            await send_message(receiver.writer, {
+                'type': 'retry_granted',
+                'connection_num': conn_num
+            })
+            
+            # Reset retry flags für diese Connection
+            sender.retry_requested[conn_num] = False
+            receiver.retry_requested[conn_num] = False
+            
+            # Reset READY flags für diese Connection (müssen neu gesendet werden)
+            sender.ready_for_connection[conn_num] = False
+            receiver.ready_for_connection[conn_num] = False
+            
+            logger.info(f"Session {session_id}: Retry granted for connection {conn_num}, waiting for new add_ports and READYs")
+            
+            # Jetzt warten beide Clients auf neue peer_info (nach add_ports)
+            # Der Coordinator wird neue peer_info senden wenn beide READY sind
+        else:
+            logger.info(f"Session {session_id}: Waiting for other peer to request retry for connection {conn_num}")

@@ -18,6 +18,50 @@ pub struct GoSignal {
     pub start_at: f64,
 }
 
+/// Wartet auf retry_granted vom Server
+async fn wait_for_retry_granted(
+    relay_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    expected_conn_num: u32,
+) -> Result<bool> {
+    let timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    
+    loop {
+        if start.elapsed() > timeout {
+            return Err(anyhow!("Timeout waiting for retry_granted"));
+        }
+        
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), relay_reader.read_line(&mut line))
+            .await
+            .map_err(|_| anyhow!("Read timeout waiting for retry_granted"))??;
+        
+        if line.trim().is_empty() {
+            return Err(anyhow!("Empty line from relay server"));
+        }
+        
+        let msg: RelayMessage = serde_json::from_str(&line)
+            .map_err(|e| anyhow!("Failed to parse relay message: {} - {}", e, line.trim()))?;
+        
+        match msg {
+            RelayMessage::RetryGranted { connection_num } => {
+                if connection_num == expected_conn_num {
+                    info!("✓ Retry granted for connection {}", connection_num + 1);
+                    return Ok(true);
+                } else {
+                    warn!("Received retry_granted for conn {} but expected {}, skipping", connection_num, expected_conn_num);
+                }
+            }
+            RelayMessage::Error { message } => {
+                return Err(anyhow!("Server error: {}", message));
+            }
+            _ => {
+                debug!("Skipping message while waiting for retry_granted: {:?}", msg);
+            }
+        }
+    }
+}
+
 /// Wartet auf ports_added_ack vom Server
 async fn wait_for_ports_added_ack(
     relay_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
@@ -387,9 +431,66 @@ pub async fn establish_multi_connections(
                         return Err(anyhow!("Max {} consecutive failures reached", MAX_FAILURES));
                     }
                     
-                    warn!("🔄 Retrying connection {} (failure {}/{})", 
+                    warn!("🔄 Requesting retry for connection {} (failure {}/{})", 
                           conn_num + 1, failures_in_a_row, MAX_FAILURES);
-                    // Loop wiederholt → neuer Zyklus für diese Connection
+                    
+                    // 1. Sende retry_request an Server
+                    let retry_msg = format!(r#"{{"type":"retry_request","connection_num":{}}}"#, conn_num) + "\n";
+                    relay_writer.write_all(retry_msg.as_bytes()).await?;
+                    relay_writer.flush().await?;
+                    info!("📤 Sent retry_request for connection {}", conn_num + 1);
+                    
+                    // 2. Warte auf retry_granted vom Server
+                    match wait_for_retry_granted(&mut relay_reader, conn_num).await {
+                        Ok(true) => {
+                            info!("✓ Retry granted by server for connection {}", conn_num + 1);
+                            
+                            // 3. Bind NEUEN Socket (alter Port ist tot!)
+                            let next_port = if let Some(last) = session.bound_sockets.last() {
+                                last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
+                            } else {
+                                return Err(anyhow!("No socket available for retry"));
+                            };
+                            
+                            match create_bound_socket(next_port) {
+                                Ok(new_socket) => {
+                                    let new_port = new_socket.local_addr()?.as_socket().map(|s| s.port()).unwrap_or(next_port);
+                                    
+                                    // Ersetze alten Socket mit neuem
+                                    if socket_index < session.bound_sockets.len() {
+                                        session.bound_sockets[socket_index] = new_socket;
+                                    } else {
+                                        session.bound_sockets.push(new_socket);
+                                    }
+                                    
+                                    info!("🔧 Retry: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
+                                    
+                                    // 4. Sende add_ports mit neuem Port
+                                    let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
+                                    let json = serde_json::to_string(&add_msg)? + "\n";
+                                    relay_writer.write_all(json.as_bytes()).await?;
+                                    relay_writer.flush().await?;
+                                    info!("📤 Sent add_ports for retry socket {}", new_port);
+                                    
+                                    // Warte auf ACK
+                                    match wait_for_ports_added_ack(&mut relay_reader, &[new_port]).await {
+                                        Ok(_) => info!("✓ New port {} confirmed by server", new_port),
+                                        Err(e) => warn!("⚠️ Failed to get ACK for new port {}: {}", new_port, e),
+                                    }
+                                    
+                                    // 5. Loop wiederholt → Warte auf neue peer_info (mit neuem Port!)
+                                }
+                                Err(e) => {
+                                    error!("Failed to bind new socket for retry: {}", e);
+                                    continue;
+                                }
+                            }
+                        }
+                        Ok(false) | Err(_) => {
+                            warn!("Retry not granted for connection {}", conn_num + 1);
+                            continue;
+                        }
+                    }
                 }
             }
         }

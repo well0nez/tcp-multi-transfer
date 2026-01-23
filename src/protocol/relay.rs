@@ -213,6 +213,18 @@ pub enum RelayMessage {
         connection_num: Option<u32>,
     },
     
+    /// Retry Request: Client will Connection erneut versuchen
+    #[serde(rename = "retry_request")]
+    RetryRequest {
+        connection_num: u32,
+    },
+    
+    /// Retry Granted: Server erlaubt Retry (beide Peers wollen)
+    #[serde(rename = "retry_granted")]
+    RetryGranted {
+        connection_num: u32,
+    },
+    
     #[serde(rename = "ping")]
     Ping {},
     
