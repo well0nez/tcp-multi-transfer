@@ -36,7 +36,7 @@ def get_peer_addresses_with_prediction(peer, other, max_scan_ports: int) -> List
     Returns:
         List of address dictionaries with ip, port, type, and priority
     """
-    from .nat_analyzer import build_candidate_ports
+    from ..nat_analyzer import build_candidate_ports
     
     addresses = []
     seen: Set[tuple] = set()
