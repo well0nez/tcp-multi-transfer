@@ -143,6 +143,9 @@ class TCPRelayServerICE:
             # Extract tcp_connections from register message
             tcp_connections = msg.get('tcp_connections', 1)
             
+            # FIX: Extract extra_ports from registration!
+            extra_ports = msg.get('extra_ports', [])
+            
             if role not in ('sender', 'receiver'):
                 await send_error(writer, f"Invalid role: {role}")
                 return
@@ -159,6 +162,11 @@ class TCPRelayServerICE:
                 prediction_range_extra_pct=prediction_range_extra_pct,
                 tcp_connections=tcp_connections,
             )
+            
+            # FIX: Store extra_ports in bound_ports so coordinator can use them!
+            if extra_ports:
+                peer.bound_ports = extra_ports.copy()
+                logger.info(f"Peer {role} registered with {len(extra_ports)} bound ports: {extra_ports}")
             
             lock = self.session_manager.get_session_lock(session_id)
             
