@@ -162,10 +162,7 @@ async fn punch_scan(
         return Err(anyhow!("No peer addresses available"));
     }
     
-    info!("🔍 SCAN mode: Trying {} unique addresses", peer_addresses.len());
-    debug!("SCAN: peer_addresses = {:?}", peer_addresses);
-    
-    // Listener Setup
+    // Listener Setup ZUERST (bevor SCAN-Log!)
     let listener_socket = socket.try_clone()?;
     listener_socket.listen(128)?;
     let std_listener: std::net::TcpListener = listener_socket.into();
@@ -173,6 +170,10 @@ async fn punch_scan(
     let listener = TcpListener::from_std(std_listener)?;
     let listener_local_port = listener.local_addr()?.port();
     info!("📡 Listener ready on port {}", listener_local_port);
+    
+    // DANN Log: SCAN mode
+    info!("🔍 SCAN mode: Trying {} unique addresses", peer_addresses.len());
+    debug!("SCAN: peer_addresses = {:?}", peer_addresses);
     
     // Channel für Kandidaten
     let channel_capacity = peer_addresses.len().saturating_add(2).max(4);
