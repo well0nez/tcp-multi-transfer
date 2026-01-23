@@ -198,11 +198,6 @@ pub enum RelayMessage {
         ports: Vec<u16>,
     },
     
-    #[serde(rename = "ports_added_ack")]
-    PortsAddedAck {
-        ports: Vec<u16>,
-    },
-    
     #[serde(rename = "go")]
     Go {
         start_at: f64,

@@ -41,10 +41,6 @@ async def wait_for_peer_messages(peer: Peer, session_manager, max_scan_ports: in
             elif msg_type == 'keepalive':
                 await send_message(peer.writer, {'type': 'keepalive_ack'})
             
-            elif msg_type == 'add_ports':
-                logger.info(f"Peer {peer.role} sent add_ports")
-                await handle_add_ports(msg, peer, session_manager)
-            
             elif msg_type == 'probes_complete':
                 logger.info(f"Peer {peer.role} sent probes_complete")
                 await handle_probes_complete(peer, session_manager, max_scan_ports)
@@ -57,69 +53,6 @@ async def wait_for_peer_messages(peer: Peer, session_manager, max_scan_ports: in
         except Exception as e:
             logger.debug(f"Error reading from {peer.role}: {e}")
             break
-
-
-async def handle_add_ports(msg: dict, peer: Peer, session_manager):
-    """Handle add_ports message from client (new ports bound for multi-connection)"""
-    ports = msg.get('ports', [])
-    if not ports:
-        logger.warning(f"Received add_ports with no ports from {peer.role}")
-        return
-    
-    session_id = peer.session_id
-    
-    logger.info(f"Peer {peer.role} added {len(ports)} new ports: {ports}")
-    
-    # Speichere die neuen Ports
-    peer.bound_ports.extend(ports)
-    
-    # Warte kurz auf eingehende Probes für die neuen Ports
-    await asyncio.sleep(0.5)  # Gib Client Zeit, Probes zu senden
-    
-    # Matche Probes mit den neuen Ports
-    if session_id in session_manager.pending_probes:
-        probes = session_manager.pending_probes[session_id]
-        peer_probes = [(ip, nat, local, ts) for ip, nat, local, ts in probes
-                       if ip == peer.public_addr[0] and local in ports]
-        
-        if peer_probes:
-            logger.info(f"Found {len(peer_probes)} probes for new ports from {peer.role}")
-            
-            # Füge neue Mappings zu probe_ports hinzu
-            for _, nat_port, local_port, _ in peer_probes:
-                if (local_port, nat_port) not in peer.probe_ports:
-                    peer.probe_ports.append((local_port, nat_port))
-                    logger.debug(f"  Added mapping: local {local_port} -> NAT {nat_port}")
-            
-            # Entferne verarbeitete Probes
-            session_manager.pending_probes[session_id] = [
-                (ip, nat, local, ts) for ip, nat, local, ts in probes
-                if not (ip == peer.public_addr[0] and local in ports)
-            ]
-        else:
-            logger.warning(f"No probes received yet for new ports from {peer.role}")
-    else:
-        logger.warning(f"No probe list found for session {session_id}")
-    
-    # Sende ACK mit den Ports zurück
-    await send_message(peer.writer, {
-        'type': 'ports_added_ack',
-        'ports': ports
-    })
-    logger.info(f"Sent ports_added_ack to {peer.role} for {len(ports)} ports")
-    
-    # Notifiziere den anderen Peer über die neuen Ports
-    lock = session_manager.get_session_lock(session_id)
-    async with lock:
-        session = session_manager.sessions.get(session_id)
-        if session:
-            other_peer = session.get('sender' if peer.role == 'receiver' else 'receiver')
-            if other_peer:
-                await send_message(other_peer.writer, {
-                    'type': 'peer_added_ports',
-                    'ports': ports
-                })
-                logger.info(f"Notified {other_peer.role} about {len(ports)} new ports from {peer.role}")
 
 
 async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: int):

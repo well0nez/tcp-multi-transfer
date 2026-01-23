@@ -1,0 +1,222 @@
+# TCP File Transfer Client
+
+High-performance TCP file transfer with NAT traversal (hole punching).
+
+A TCP file-transfer tool with NAT traversal (TCP hole punching) coordinated by a lightweight relay. It probes NAT behavior to build a bounded port candidate list, improving success against tricky NAT types without relaying traffic. Once connected, it uses direct P2P TCP with SHA256 integrity checks for reliable transfer.
+
+## Features
+
+- **TCP Hole Punching**: Establishes direct peer-to-peer TCP connections through NAT
+- **NAT Probing + Prediction**: Uses a probe port to predict a NAT port range and build a capped scan list
+- **SHA256 Verification**: Ensures file integrity after transfer
+- **Progress Bar**: Real-time transfer progress with speed display
+- **Multi-TCP (optional)**: Use multiple parallel TCP connections for transfer
+- **Session-Based**: Both peers connect using a shared session ID
+
+## How It Works
+
+1. Both sender and receiver connect to the relay server with the same session ID
+2. The relay server probes NAT behavior (if needed) and exchanges peer addresses
+3. Both peers attempt TCP hole punching simultaneously
+4. Once connected, the file is transferred directly peer-to-peer
+5. SHA256 verification ensures file integrity
+
+## Port Prediction and Scan Method
+
+The relay server runs a short NAT probing phase when a peer does not preserve ports:
+
+- The client opens several quick probe connections to `--probe-port` (server waits for at least 5).
+- The server records `(local_port, observed_public_port, timestamp)` and computes a prediction model:
+  - delta = public_port - local_port
+  - predicted_port = local_port + median(delta)
+  - error_range = max deviation + jitter (2 * stdev, min 2)
+  - For progressing symmetric NATs, estimate a port allocation rate and shift the prediction forward
+    (`port_rate * prediction_delay * RATE_DAMPING`, capped by `MAX_RATE_SHIFT`).
+- The server classifies the pattern (`port_preserved`, `constant_delta`, `small/medium/large_delta_range`,
+  `random_like`) and builds a bounded candidate list:
+  - For non-random patterns, use a contiguous window around `predicted_port` and cap to `MAX_SCAN_PORTS`.
+  - For `random_like`, use the observed min/max range and build a sparse list:
+    `predicted_port`, `min_port+1..+5`, plus evenly spaced samples, capped to `MAX_SCAN_PORTS`.
+- The server sends `peer_info` with the prioritized candidate list; the client tries only those candidates.
+
+These additions (rate-based forward shift and sparse random-like sampling) extend the standard delta-only
+prediction and reduce the number of attempts without a full port sweep.
+
+### Scan Cap (MAX_SCAN_PORTS)
+
+You can raise the scan cap with `--max-scan-ports`. Higher values can improve success on symmetric/random
+NAT because the peer-specific NAT port may lie outside the small probe-derived range. The tradeoffs:
+
+- Pros: Higher success probability when NAT port allocation is wide or target-dependent.
+- Cons: More outbound connection attempts, higher CPU/network load, and potential throttling by NATs/ISPs.
+
+In our tests, the biggest gains came from widening the scan window with
+`--prediction-range-extra-pct` (often 20-50). Combined with `--max-scan-ports 512`, this reached
+roughly 99% success on difficult NAT pairs, but results still depend on the networks and devices involved.
+
+### Client Prediction Mode
+
+Use `--prediction-mode external` to predict from observed public ports only (mean + deviation), without
+using local-port deltas. This can help when symmetric/random NATs allocate ports in a target-dependent way.
+
+- Pros: Can stabilize prediction when local-port deltas are noisy or misleading.
+- Cons: Ignores local-port correlation; may reduce accuracy on stable delta NATs.
+
+You can also expand the scan range with `--prediction-range-extra-pct` (applies to both modes).
+The value is a percentage of the computed scan span and is split across both sides of the
+window. Example: a range of 100..200 with 5 expands to 98..203, and the final candidate
+list is still capped by `MAX_SCAN_PORTS`.
+In practice, this can yield significantly better results when the true NAT ports sit within
+a wider band than the probe-derived window. If delta or external prediction is too tight,
+raising this to around 20-50 can materially improve success rates.
+
+### Probe Debug Mode
+
+Use `--probe-debug` to run only the probe phase and print summary stats
+(min/max/range/median/stdev) plus an estimated NAT type. The probe port is derived as `server_port - 1`
+(for example, `--server 1.2.3.4:9999` probes `1.2.3.4:9998`).
+
+Example:
+```bash
+./tcp-transfer -s 1.2.3.4:9999 -i test -m receive --probe-debug --probe-count 25
+```
+
+## Usage
+
+### Prerequisites
+
+Start the relay server:
+```bash
+python3 tcp_server_ice_NEW.py --port 9999 --probe-port 9998 --max-scan-ports 512
+```
+Ensure both ports are reachable from the public Internet.
+
+Relay server options:
+```
+  --host <HOST>             Host to bind to [default: 0.0.0.0]
+  --port <PORT>             Main port [default: 9999]
+  --probe-port <PORT>       Probe port for NAT analysis [default: 9998]
+  --max-scan-ports <N>      Max candidate ports sent to clients [default: 512]
+```
+
+### Receiver (start first)
+
+```bash
+./tcp-transfer -s relay-server:9999 -i my-session -m receive
+```
+
+### Sender
+
+```bash
+./tcp-transfer -s relay-server:9999 -i my-session -m send -f myfile.mp4
+```
+
+### Options
+
+```
+Options:
+  -s, --server <SERVER>      Relay server address (host:port)
+  -i, --session-id <ID>      Session ID (both peers must use the same)
+  -m, --mode <MODE>          Mode: send or receive
+  -f, --file <FILE>          File to send (sender mode only)
+      --timeout <SECONDS>    Hole punch timeout [default: 30]
+      --probe-count <N>      NAT probe connection count [default: 10]
+      --probe-debug          Run probe-only debug mode and print summary stats
+      --prediction-mode <MODE>  NAT prediction mode: delta or external [default: delta]
+      --prediction-range-extra-pct <PCT>  Expand scan range by percentage [default: 0]
+      --chunk <SIZE>         Chunk size for transfer (e.g., 512KB, 1MB) [default: 8MB]
+      --debug                Enable debug logging
+      --tcp-connections <N>  Number of parallel TCP connections (multi TCP) [default: 1]
+      --scan-budget <N>      Global scan budget across all connections (0 = unlimited) [default: 1024]
+      --punch-overshoot <N>  Overshoot factor for hole punching (starts N*tcp_connections punches) [default: 2]
+      --allow-fallback       Allow fallback if fewer connections are established
+      --min-connections <N>  Minimum connections required when fallback is enabled [default: 1]
+      --chunk <CHUNK>        Chunk size for transfer (e.g., 512KB, 1MB, 4MB) [default: 4MB]
+  -h, --help                 Print help
+  -V, --version              Print version
+
+Multi-TCP options:
+      --tcp-connections <N>  Number of parallel TCP connections [default: 1, allowed: 1,2,4,8]
+      --scan-budget <N>      Global scan budget across all connections (0 = unlimited) [default: 1024]
+```
+
+
+## Building
+
+```bash
+cargo build --release
+```
+
+The binary will be at `target/release/tcp-transfer`.
+
+## Protocol
+
+### Relay Server Protocol (JSON over TCP)
+
+1. **Registration**: Client sends `{"type": "register", "session_id": "...", "role": "sender|receiver", "local_port": 12345}`
+   - Optional for Multi-TCP: `"tcp_connections": N` and `"local_ports": [..]`
+2. **Registered**: Server responds `{"type": "registered", "your_public_addr": ["ip", port], "needs_probing": true|false, "probe_port": 9998}`
+3. **Peer Info**: When both peers are connected, server sends `{"type": "peer_info", "peer_public_addr": ["ip", port], "peer_addresses": [...], "peer_nat_analysis": {...}}`
+   - Optional: `peer_port_analyses` list with per-local-port NAT analysis
+
+### File Transfer Protocol (Binary over direct TCP)
+
+1. **HELLO**: Both peers exchange `[type=1][len][role]`
+2. **FILE_INFO**: Sender sends `[type=2][name_len][size][filename][sha256]`
+3. **FILE_INFO_ACK**: Receiver acknowledges `[type=3]`
+4. **Data Stream**: Raw file bytes (TCP handles reliability)
+5. **DONE**: Sender signals completion `[type=5]`
+6. **ACK**: Receiver confirms SHA256 verified `[type=6]`
+
+## Comparison with UDP Hole Punching (general)
+
+Note: This repo does not include a UDP implementation; the comparison is conceptual.
+
+| Aspect | UDP hole punching | TCP hole punching |
+|--------|-------------------|-------------------|
+| Transport state | Connectionless; mapping created by outbound packets | Connection-oriented; requires SYN exchange |
+| Timing sensitivity | More tolerant of timing skew | More sensitive; often needs simultaneous open |
+| NAT traversal difficulty | Generally easier across NAT types | Generally harder, especially with symmetric NATs |
+| Reliability/ordering | Must be implemented by the application if needed | Built-in reliability, ordering, congestion control |
+| Probing cost | Lightweight probes to learn mappings | Probing uses TCP handshakes and is more rigid |
+| Success on symmetric NAT | Often needs prediction/relay | Often fails without prediction/relay |
+
+## Troubleshooting
+
+### Hole punch fails
+
+TCP hole punching is more difficult than UDP and may not work with all NAT types:
+- **Full Cone NAT**: Usually works
+- **Restricted Cone NAT**: Usually works
+- **Port Restricted Cone NAT**: May work
+- **Symmetric NAT**: Unlikely to work
+
+If hole punching fails, consider:
+1. Using a TURN-style relay fallback
+2. Retrying multiple times for random-port or symmetric NATs (success can be probabilistic)
+
+### Connection timeout
+
+Increase the timeout: `--timeout 60`
+
+### Debug mode
+
+Use `--debug` for detailed logging.
+
+## References
+
+These papers and implementations informed the NAT probing and prediction approach:
+
+- Kazuhiro Tobe, Akihiro Shimoda, Shigeki Goto. "Extended UDP Multiple Hole Punching Method to Traverse Large Scale NATs." https://pdfs.semanticscholar.org/953d/438516e9b2eb2bf35528de3e1fb0e9b164f8.pdf
+- Daniel Maier, Oliver Haase, Juergen Waesch, Marcel Waldvogel. "NAT Hole Punching Revisited." Technical Report No. KN-2011-DiSy-02. https://kops.uni-konstanz.de/server/api/core/bitstreams/29a35a1d-40f1-4290-9d03-dae21f2b9c36/content
+- Simon Keller, Tobias Hossfeld, Sebastian von Mammen. "Edge-Case Integration into Established NAT Traversal Techniques." IEEE ICCE 2022. https://downloads.hci.informatik.uni-wuerzburg.de/2022-icce-keller.pdf
+- Chongyc/natblaster (GitHub). https://github.com/chongyc/natblaster
+
+Influence summary (high level):
+- Multi-probe port prediction and bounded scan lists for CGN/LSN-style NATs.
+- Progressing vs random symmetric NAT handling, including rate-based forward shift and heuristics.
+- Practical scanning strategies and implementation patterns for NAT probing.
+
+## License
+
+MIT

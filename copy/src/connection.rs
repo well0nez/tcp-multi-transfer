@@ -9,62 +9,13 @@ use tokio::net::TcpStream;
 use anyhow::{Result, anyhow};
 use tracing::{info, error, warn, debug};
 
-use crate::protocol::{RelayMessage, AddPortsMessage};
+use crate::protocol::RelayMessage;
 use crate::punch::{punch_connection_with_strategy, PeerInfo, current_timestamp};
-use crate::relay::{Session, create_bound_socket, probe_new_ports};
+use crate::relay::{Session, create_bound_socket};
 
 /// GO Signal mit Zeitstempel
 pub struct GoSignal {
     pub start_at: f64,
-}
-
-/// Wartet auf ports_added_ack vom Server
-async fn wait_for_ports_added_ack(
-    relay_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
-    expected_ports: &[u16],
-) -> Result<()> {
-    let timeout = Duration::from_secs(30);
-    let start = std::time::Instant::now();
-    
-    loop {
-        if start.elapsed() > timeout {
-            return Err(anyhow!("Timeout waiting for ports_added_ack"));
-        }
-        
-        let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), relay_reader.read_line(&mut line))
-            .await
-            .map_err(|_| anyhow!("Read timeout waiting for ports_added_ack"))??;
-        
-        if line.trim().is_empty() {
-            return Err(anyhow!("Empty line from relay server"));
-        }
-        
-        let msg: RelayMessage = serde_json::from_str(&line)
-            .map_err(|e| anyhow!("Failed to parse relay message: {} - {}", e, line.trim()))?;
-        
-        match msg {
-            RelayMessage::PortsAddedAck { ports } => {
-                info!("✓ Received ports_added_ack for {} ports", ports.len());
-                
-                // Verify we got ACK for all expected ports
-                let expected_set: std::collections::HashSet<_> = expected_ports.iter().copied().collect();
-                let acked_set: std::collections::HashSet<_> = ports.iter().copied().collect();
-                
-                if expected_set == acked_set {
-                    return Ok(());
-                } else {
-                    warn!("⚠️ ACK ports don't match expected: expected {:?}, got {:?}", expected_ports, ports);
-                }
-            }
-            RelayMessage::Error { message } => {
-                return Err(anyhow!("Server error: {}", message));
-            }
-            _ => {
-                debug!("Skipping message while waiting for ports_added_ack: {:?}", msg);
-            }
-        }
-    }
 }
 
 /// Wartet auf peer_info Message für eine bestimmte Connection
@@ -164,138 +115,22 @@ pub async fn establish_multi_connections(
     mut relay_writer: tokio::net::tcp::OwnedWriteHalf,
     session: &mut Session,
     tcp_connections: u32,
-    role: &str,
     timeout: Duration,
-    session_id: &str,
-    server_addr: SocketAddr,
-    probe_port: Option<u16>,
 ) -> Result<Vec<TcpStream>> {
     let mut streams = Vec::new();
     let mut failures_in_a_row = 0;
     const MAX_FAILURES: u32 = 5;
     
-    // Für Receiver: Empfange ERSTE peer_info VOR der Schleife!
-    let (actual_tcp_connections, start_conn) = if role == "receiver" {
-        info!("📡 Receiver: Waiting for initial peer_info (connection 1/?)...");
-        
-        // 1. Warte auf peer_info für conn=0
-        let (peer_info, punch_strategy, peer_tcp_connections) = receive_peer_info_for_connection(
-            &mut relay_reader,
-            0
-        ).await?;
-        
-        info!("✓ Received initial peer_info: peer wants {} connections", peer_tcp_connections);
-        
-        // 2. Bind zusätzliche Sockets falls nötig
-        if peer_tcp_connections > tcp_connections {
-            info!("🔄 Binding {} more sockets...", peer_tcp_connections - tcp_connections);
-            
-            let needed_more = (peer_tcp_connections - tcp_connections) as usize;
-            let next_port = if let Some(last) = session.bound_sockets.last() {
-                last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
-            } else {
-                0
-            };
-            
-            if next_port > 0 {
-                let mut added_count = 0;
-                let mut attempt_counter = 0;
-                let mut current_port = next_port;
-                let mut new_ports = Vec::new();
-                
-                while added_count < needed_more && attempt_counter < 100 {
-                    match create_bound_socket(current_port) {
-                        Ok(s) => {
-                            session.bound_sockets.push(s);
-                            new_ports.push(current_port);
-                            added_count += 1;
-                            debug!("Bound extra socket on port {}", current_port);
-                        },
-                        Err(_) => {}
-                    }
-                    current_port = current_port.wrapping_add(1);
-                    attempt_counter += 1;
-                }
-                
-                info!("✓ Bound {} additional sockets (total: {})", added_count, session.bound_sockets.len());
-                
-                // NEU: Probe die neuen Ports sofort!
-                if !new_ports.is_empty() && probe_port.is_some() {
-                    let probe_addr = SocketAddr::new(server_addr.ip(), probe_port.unwrap());
-                    
-                    info!("🔍 Probing {} new ports before sending add_ports...", new_ports.len());
-                    
-                    // 1. Führe Probes durch
-                    match probe_new_ports(probe_addr, session_id, &new_ports, 5).await {
-                        Ok(_) => {
-                            info!("✓ Probing successful");
-                            
-                            // 2. Sende AddPortsMessage
-                            let add_msg = AddPortsMessage::new(session_id, new_ports.clone());
-                            let json = serde_json::to_string(&add_msg)? + "\n";
-                            relay_writer.write_all(json.as_bytes()).await?;
-                            relay_writer.flush().await?;
-                            info!("✓ Sent add_ports message");
-                            
-                            // 3. Warte auf ACK
-                            match wait_for_ports_added_ack(&mut relay_reader, &new_ports).await {
-                                Ok(_) => info!("✓ New ports confirmed by server"),
-                                Err(e) => warn!("⚠️ Failed to get ACK for new ports: {}", e),
-                            }
-                        }
-                        Err(e) => {
-                            warn!("⚠️ Probing failed: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-        
-        info!("✓ Received peer_info for connection 1/{}: strategy={}", peer_tcp_connections, punch_strategy);
-        
-        // 3. Sende READY
-        let ready_msg = format!(r#"{{"type":"ready","connection_num":0}}"#) + "\n";
-        relay_writer.write_all(ready_msg.as_bytes()).await?;
-        relay_writer.flush().await?;
-        info!("✓ READY sent for connection 1/{}", peer_tcp_connections);
-        
-        // 4. Warte auf GO
-        let go_signal = receive_go_for_connection(&mut relay_reader, 0).await?;
-        let countdown = go_signal.start_at - current_timestamp();
-        info!("✓ GO received for connection 1/{}! Start in {:.2}s", peer_tcp_connections, countdown);
-        
-        // 5. Punch erste Connection
-        let socket_index = 0;
-        if socket_index >= session.bound_sockets.len() {
-            return Err(anyhow!("No socket available for connection 0"));
-        }
-        
-        let stream = punch_connection_with_strategy(
-            session.bound_sockets[socket_index].try_clone()?,
-            &peer_info,
-            &punch_strategy,
-            go_signal.start_at,
-            session.time_offset,
-            timeout,
-        ).await?;
-        
-        streams.push(stream);
-        info!("✅ Connection 1/{} established!", peer_tcp_connections);
-        
-        // Schleife startet bei 1 (erste Connection bereits etabliert)
-        (peer_tcp_connections, 1)
-    } else {
-        // Sender weiß schon, wie viele er will - Schleife startet bei 0
-        (tcp_connections, 0)
-    };
+    // CRITICAL: Für den Receiver - lese tcp_connections aus der ERSTEN peer_info!
+    // Der Sender bestimmt, wie viele Connections genutzt werden.
+    let mut actual_tcp_connections = tcp_connections;
     
-    // Hauptschleife für verbleibende Connections
-    for conn_num in start_conn..actual_tcp_connections {
+    for conn_num in 0..actual_tcp_connections {
         info!("📡 Waiting for peer_info for connection {}/{}...", conn_num + 1, actual_tcp_connections);
         
         loop {  // Retry-Loop für diese Connection
             // 1. Warte auf peer_info für diese Connection
-            let (peer_info, punch_strategy, _peer_tcp_connections) = match receive_peer_info_for_connection(
+            let (peer_info, punch_strategy, peer_tcp_connections) = match receive_peer_info_for_connection(
                 &mut relay_reader,
                 conn_num
             ).await {
@@ -310,7 +145,45 @@ pub async fn establish_multi_connections(
                 }
             };
             
-            info!("✓ Received peer_info for connection {}/{}: strategy={}", conn_num + 1, actual_tcp_connections, punch_strategy);
+            // CRITICAL: Bei der ERSTEN peer_info - übernehme tcp_connections vom Peer (Sender bestimmt!)
+            if conn_num == 0 && peer_tcp_connections > actual_tcp_connections {
+                info!("🔄 Peer wants {} connections, we only prepared {}. Binding more sockets...", 
+                      peer_tcp_connections, actual_tcp_connections);
+                
+                let needed_more = (peer_tcp_connections - actual_tcp_connections) as usize;
+                let next_port = if let Some(last) = session.bound_sockets.last() {
+                    last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
+                } else {
+                    0
+                };
+                
+                if next_port > 0 {
+                    let mut added_count = 0;
+                    let mut attempt_counter = 0;
+                    let mut current_port = next_port;
+                    
+                    while added_count < needed_more && attempt_counter < 100 {
+                        match create_bound_socket(current_port) {
+                            Ok(s) => {
+                                session.bound_sockets.push(s);
+                                added_count += 1;
+                                debug!("Bound extra socket on port {}", current_port);
+                            },
+                            Err(_) => {}
+                        }
+                        current_port = current_port.wrapping_add(1);
+                        attempt_counter += 1;
+                    }
+                    
+                    info!("✓ Bound {} additional sockets (total: {})", added_count, session.bound_sockets.len());
+                }
+                
+                // Update the actual connection count
+                actual_tcp_connections = peer_tcp_connections;
+                info!("✓ Adjusted to {} connections as requested by peer", actual_tcp_connections);
+            }
+            
+            info!("✓ Received peer_info for connection {}: strategy={}", conn_num + 1, punch_strategy);
             
             // 2. Sende READY mit connection_num
             let ready_msg = format!(r#"{{"type":"ready","connection_num":{}}}"#, conn_num) + "\n";
@@ -351,7 +224,7 @@ pub async fn establish_multi_connections(
                 Ok(stream) => {
                     failures_in_a_row = 0;  // Reset bei Erfolg
                     streams.push(stream);
-                    info!("✅ Connection {}/{} established!", conn_num + 1, actual_tcp_connections);
+                    info!("✅ Connection {}/{} established!", conn_num + 1, tcp_connections);
                     break;  // Nächste Connection
                 }
                 Err(e) => {

@@ -85,18 +85,12 @@ async fn run_sender(
 
     // NEU: Etabliere Connections mit strategie-basiertem Hole Punching
     let tcp_conns = session.tcp_connections;  // Copy before mutable borrow
-    let srv_addr = session.server_addr;  // Copy before mutable borrow
-    let probe_p = session.probe_port;  // Copy before mutable borrow
     let streams = establish_multi_connections(
         relay_reader,
         relay_writer,
         &mut session,
         tcp_conns,
-        "sender",
         timeout,
-        session_id,
-        srv_addr,
-        probe_p,
     ).await?;
 
     // Validierung der etablierten Connections
@@ -174,18 +168,12 @@ async fn run_receiver(
 
     // NEU: Etabliere Connections mit strategie-basiertem Hole Punching
     let tcp_conns = session.tcp_connections;  // Copy before mutable borrow
-    let srv_addr = session.server_addr;  // Copy before mutable borrow
-    let probe_p = session.probe_port;  // Copy before mutable borrow
     let streams = establish_multi_connections(
         relay_reader,
         relay_writer,
         &mut session,
         tcp_conns,
-        "receiver",
         timeout,
-        session_id,
-        srv_addr,
-        probe_p,
     ).await?;
 
     // Validierung der etablierten Connections
