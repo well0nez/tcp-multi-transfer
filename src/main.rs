@@ -385,7 +385,9 @@ async fn receive_peer_info_for_connection(
 ) -> Result<(PeerInfo, String)> {
     loop {
         let mut line = String::new();
-        relay_reader.read_line(&mut line).await?;
+        tokio::time::timeout(Duration::from_secs(120), relay_reader.read_line(&mut line))
+            .await
+            .map_err(|_| anyhow!("Timeout waiting for peer_info (120s)"))??;
         
         if line.trim().is_empty() {
             return Err(anyhow!("Empty line from relay server"));
@@ -435,7 +437,9 @@ async fn receive_go_for_connection(
 ) -> Result<GoSignal> {
     loop {
         let mut line = String::new();
-        relay_reader.read_line(&mut line).await?;
+        tokio::time::timeout(Duration::from_secs(120), relay_reader.read_line(&mut line))
+            .await
+            .map_err(|_| anyhow!("Timeout waiting for GO (120s)"))??;
         
         if line.trim().is_empty() {
             return Err(anyhow!("Empty line from relay server"));

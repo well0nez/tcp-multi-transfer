@@ -59,54 +59,55 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
     """Handle probes_complete message from client"""
     session_id = peer.session_id
 
+    # SCHRITT 1: Setze probes_done (entweder direkt oder nach Analyse)
     if not peer.needs_probing:
         peer.probes_done = True
         logger.info(f"Peer {peer.role} probes_done=True (no probing required)")
-        return
-    
-    if session_id in session_manager.pending_probes:
-        probes = session_manager.pending_probes[session_id]
-        peer_probes = [(ip, nat, local, ts) for ip, nat, local, ts in probes
-                       if ip == peer.public_addr[0]]
-        
-        if peer_probes:
-            logger.info(f"Analyzing {len(peer_probes)} probes from {peer.role}")
-            peer.nat_analysis = analyze_nat(
-                peer_probes,
-                peer.local_port,
-                peer.prediction_mode,
-                peer.prediction_range_extra_pct,
-            )
-            # Clear used probes
-            session_manager.pending_probes[session_id] = [
-                (ip, nat, local, ts) for ip, nat, local, ts in probes
-                if ip != peer.public_addr[0]
-            ]
-        else:
-            logger.warning(f"No probes received from {peer.role}")
     else:
-        logger.warning(f"No probe list found for session {session_id}")
+        # Probe-Analyse nur wenn needed
+        if session_id in session_manager.pending_probes:
+            probes = session_manager.pending_probes[session_id]
+            peer_probes = [(ip, nat, local, ts) for ip, nat, local, ts in probes
+                           if ip == peer.public_addr[0]]
+            
+            if peer_probes:
+                logger.info(f"Analyzing {len(peer_probes)} probes from {peer.role}")
+                peer.nat_analysis = analyze_nat(
+                    peer_probes,
+                    peer.local_port,
+                    peer.prediction_mode,
+                    peer.prediction_range_extra_pct,
+                )
+                # Clear used probes
+                session_manager.pending_probes[session_id] = [
+                    (ip, nat, local, ts) for ip, nat, local, ts in probes
+                    if ip != peer.public_addr[0]
+                ]
+            else:
+                logger.warning(f"No probes received from {peer.role}")
+        else:
+            logger.warning(f"No probe list found for session {session_id}")
 
-    if not peer.nat_analysis:
-        # Create basic analysis from registration
-        peer.nat_analysis = NATAnalysis(
-            probed_ports=[peer.public_addr[1]],
-            local_ports=[peer.local_port],
-            min_port=peer.public_addr[1],
-            max_port=peer.public_addr[1],
-            port_range=0,
-            predicted_port=peer.public_addr[1],
-            error_range=0,
-            pattern_type="insufficient_data",
-            needs_scan=False,
-            scan_start=peer.public_addr[1],
-            scan_end=peer.public_addr[1],
-        )
+        if not peer.nat_analysis:
+            # Create basic analysis from registration
+            peer.nat_analysis = NATAnalysis(
+                probed_ports=[peer.public_addr[1]],
+                local_ports=[peer.local_port],
+                min_port=peer.public_addr[1],
+                max_port=peer.public_addr[1],
+                port_range=0,
+                predicted_port=peer.public_addr[1],
+                error_range=0,
+                pattern_type="insufficient_data",
+                needs_scan=False,
+                scan_start=peer.public_addr[1],
+                scan_end=peer.public_addr[1],
+            )
+        
+        peer.probes_done = True
+        logger.info(f"Peer {peer.role} probes_done=True")
     
-    peer.probes_done = True
-    logger.info(f"Peer {peer.role} probes_done=True")
-    
-    # NEU: Starte Multi-Connection Koordination wenn beide ready
+    # SCHRITT 2: Prüfe IMMER, ob beide Peers bereit sind (unabhängig vom Probe-Status)
     lock = session_manager.get_session_lock(session_id)
     async with lock:
         session = session_manager.sessions.get(session_id)
