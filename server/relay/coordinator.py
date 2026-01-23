@@ -217,27 +217,27 @@ def get_nat_port_for_local_port(peer, local_port: int) -> int:
 
 def determine_punch_strategy(my_peer, other_peer) -> str:
     """
-    Bestimme Punch-Strategie basierend auf NAT-Typen.
+    Bestimme Punch-Strategie für TCP Hole Punching.
     
-    Strategien:
-    - "listen": Warte auf eingehende Verbindung (NAT-friendly zu NAT-friendly)
-    - "connect": Direkter Connect (NAT-friendly zu NAT-friendly)
-    - "scan": Scanne Port-Range + Listener parallel (Complex NAT oder gemischt)
+    Strategie:
+    - "scan": Simultaneous Open (Listener + Connect parallel)
     
-    Wichtig: Im SCAN Mode läuft IMMER ein Listener parallel zum Scanner!
+    ALLE NAT-Typen benötigen Simultaneous Open!
+    Beide Peers müssen gleichzeitig:
+    1. Einen Listener starten
+    2. Zum Peer connecten
+    
+    Das öffnet "Löcher" in beiden NATs und ermöglicht die Verbindung.
+    
+    Unterschied zwischen NAT-Typen:
+    - Port-Preserved NAT: peer_addresses enthält nur 1 Adresse (vorhersagbar)
+      → Schneller, da nur 1 Connect-Versuch nötig
+    - Complex NAT (CGNAT): peer_addresses enthält 100-500 Adressen (Port-Range)
+      → Dauert länger, da viele Connect-Versuche parallel
+    
+    Beide verwenden die GLEICHE Strategie (SCAN = Simultaneous Open),
+    nur die Anzahl der Adressen unterscheidet sich!
     """
-    my_nat = my_peer.nat_analysis
-    other_nat = other_peer.nat_analysis
-    
-    my_friendly = my_nat and my_nat.pattern_type == "port_preserved"
-    other_friendly = other_nat and other_nat.pattern_type == "port_preserved"
-    
-    if my_friendly and other_friendly:
-        # Beide NAT-friendly: Einer listet, einer connected
-        return "connect" if my_peer.role == "sender" else "listen"
-    else:
-        # ALLE ANDEREN FÄLLE: SCAN (mit Listener parallel!)
-        # - Mixed (friendly + complex): Beide müssen scannen UND lauschen
-        # - Beide complex: Beide müssen scannen UND lauschen
-        # SCAN = Simultaneous Open (Scanner + Listener parallel)
-        return "scan"
+    # IMMER Simultaneous Open verwenden!
+    # Das ist der einzige korrekte Weg für NAT Traversal.
+    return "scan"
