@@ -46,9 +46,7 @@ async def coordinate_multi_connections(
     for conn_num in range(tcp_connections):
         logger.info(f"Session {session_id}: Coordinating connection {conn_num+1}/{tcp_connections}")
         
-        # 0. NEU: Warte bis BEIDE Peers genug Ports für diese Connection haben!
-        # Das stellt sicher, dass peer_info den RICHTIGEN Port enthält.
-        max_port_wait = 60.0  # Max 60s warten auf Ports
+        max_port_wait = 60.0
         port_wait_start = time.time()
         while True:
             sender_has_port = conn_num < len(sender.bound_ports)
@@ -113,11 +111,8 @@ async def coordinate_multi_connections(
             sender.ready_for_connection[conn_num] = False
             receiver.ready_for_connection[conn_num] = False
         
-        # 5. KEINE feste Pause mehr! Port-Synchronisation (Schritt 0) stellt sicher,
-        # dass der nächste Port verfügbar ist bevor peer_info gesendet wird.
-        # Nur minimale Pause für Message-Processing:
         if conn_num < tcp_connections - 1:
-            await asyncio.sleep(0.1)  # Minimale Pause für Message-Ordering
+            await asyncio.sleep(0.1)
 
 
 async def send_peer_info_for_connection(
@@ -131,11 +126,9 @@ async def send_peer_info_for_connection(
     """Sende peer_info für eine spezifische Connection mit Punch-Strategie"""
     from .utils import get_peer_addresses_with_prediction
     
-    # Port-Auswahl für diese Connection
     sender_port = sender.bound_ports[conn_num] if conn_num < len(sender.bound_ports) else sender.local_port
     receiver_port = receiver.bound_ports[conn_num] if conn_num < len(receiver.bound_ports) else receiver.local_port
     
-    # FIX: Finde die richtigen NAT-Ports aus probe_ports!
     sender_nat_port = get_nat_port_for_local_port(sender, sender_port)
     receiver_nat_port = get_nat_port_for_local_port(receiver, receiver_port)
     
@@ -147,29 +140,23 @@ async def send_peer_info_for_connection(
     sender_strategy = determine_punch_strategy(sender, receiver)
     receiver_strategy = determine_punch_strategy(receiver, sender)
     
-    # FIX: Baue peer_addresses mit RICHTIGEM base_port für diese Connection!
-    # get_peer_addresses_with_prediction() generiert Port-Range für Complex NATs,
-    # aber verwendet jetzt den RICHTIGEN per-Connection Port als Basis.
     sender_addrs = get_peer_addresses_with_prediction(
         sender, receiver, max_scan_ports,
-        base_port=sender_nat_port  # ← Richtiger Port für DIESE Connection!
+        base_port=sender_nat_port
     )
     
     receiver_addrs = get_peer_addresses_with_prediction(
         receiver, sender, max_scan_ports,
-        base_port=receiver_nat_port  # ← Richtiger Port für DIESE Connection!
+        base_port=receiver_nat_port
     )
     
     logger.debug(f"Connection {conn_num}: sender_addrs={len(sender_addrs)} addresses (primary={sender_nat_port}), "
                  f"receiver_addrs={len(receiver_addrs)} addresses (primary={receiver_nat_port})")
     
-    # Sende an Sender
-    # peer_nat_analysis = NAT-Analyse des PEERS (Port-Range zum Scannen)
-    # Der Sender scannt die Port-Range des Receivers
     msg_to_sender = {
         'type': 'peer_info',
         'connection_num': conn_num,
-        'peer_public_addr': [receiver.public_addr[0], receiver_nat_port],  # FIX: Richtiger NAT-Port!
+        'peer_public_addr': [receiver.public_addr[0], receiver_nat_port],
         'peer_local_port': receiver_port,
         'peer_addresses': receiver_addrs,
         'your_role': 'sender',
@@ -180,21 +167,17 @@ async def send_peer_info_for_connection(
     }
     await send_message(sender.writer, msg_to_sender)
     
-    # Sende an Receiver
-    # peer_nat_analysis = NAT-Analyse des PEERS (Port-Range zum Scannen)
-    # Der Receiver scannt die Port-Range des Senders
-    # WICHTIG: Sende die tcp_connections des SENDERS, damit Receiver weiß, wie viele Connections nötig sind!
     msg_to_receiver = {
         'type': 'peer_info',
         'connection_num': conn_num,
-        'peer_public_addr': [sender.public_addr[0], sender_nat_port],  # FIX: Richtiger NAT-Port!
+        'peer_public_addr': [sender.public_addr[0], sender_nat_port],
         'peer_local_port': sender_port,
         'peer_addresses': sender_addrs,
         'your_role': 'receiver',
         'same_network': False,
         'peer_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None,
         'punch_strategy': receiver_strategy,
-        'tcp_connections': sender.tcp_connections,  # ← CRITICAL: Receiver muss wissen, wie viele Connections der Sender will!
+        'tcp_connections': sender.tcp_connections,
     }
     await send_message(receiver.writer, msg_to_receiver)
     

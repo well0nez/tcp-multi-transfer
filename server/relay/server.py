@@ -143,7 +143,6 @@ class TCPRelayServerICE:
             # Extract tcp_connections from register message
             tcp_connections = msg.get('tcp_connections', 1)
             
-            # FIX: Extract extra_ports from registration!
             extra_ports = msg.get('extra_ports', [])
             
             if role not in ('sender', 'receiver'):
@@ -163,7 +162,6 @@ class TCPRelayServerICE:
                 tcp_connections=tcp_connections,
             )
             
-            # FIX: Store extra_ports in bound_ports so coordinator can use them!
             if extra_ports:
                 peer.bound_ports = extra_ports.copy()
                 logger.info(f"Peer {role} registered with {len(extra_ports)} bound ports: {extra_ports}")
@@ -222,7 +220,7 @@ class TCPRelayServerICE:
                 'your_role': role,
                 'session_id': session_id,
                 'server_time': server_times[0],  # Keep first for backward compat
-                'server_times': server_times,     # NEW: Multiple timestamps for median
+                'server_times': server_times,
                 'initial_delta': initial_delta,
                 'port_preserved': port_preserved,
                 'needs_probing': peer.needs_probing,

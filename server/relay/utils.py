@@ -53,7 +53,7 @@ def get_peer_addresses_with_prediction(peer, other, max_scan_ports: int, base_po
         addresses.append({
             'ip': ip,
             'port': port,
-            'addr_type': addr_type,  # FIX: 'type' → 'addr_type' für JSON-Konsistenz
+            'addr_type': addr_type,
             'priority': priority
         })
     
@@ -65,7 +65,7 @@ def get_peer_addresses_with_prediction(peer, other, max_scan_ports: int, base_po
         scan_ports = build_candidate_ports(peer.nat_analysis, max_scan_ports)
         for i, port in enumerate(scan_ports):
             # Nur Ports hinzufügen, die NICHT bereits der PRIMARY Port sind
-            if port != primary_port:  # FIX: Vergleiche mit primary_port statt public_addr[1]
+            if port != primary_port:
                 add_address(peer.public_addr[0], port, 'predicted_range', 10 + i)
     
     # Sort by priority

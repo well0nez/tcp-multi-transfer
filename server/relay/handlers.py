@@ -30,13 +30,9 @@ async def wait_for_peer_messages(peer: Peer, session_manager, max_scan_ports: in
             msg_type = msg.get('type')
             
             if msg_type == 'ready':
-                # NEU: Connection-spezifisches READY
                 conn_num = msg.get('connection_num', 0)
                 peer.ready_for_connection[conn_num] = True
                 logger.info(f"Peer {peer.role} is READY for connection {conn_num}")
-                
-                # NICHT mehr try_send_go aufrufen!
-                # Multi-Connection Loop handled das
             
             elif msg_type == 'keepalive':
                 await send_message(peer.writer, {'type': 'keepalive_ack'})
@@ -76,9 +72,6 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
     
     # Speichere die neuen Ports
     peer.bound_ports.extend(ports)
-    
-    # KEIN Sleep mehr! Port-Preserved NATs brauchen kein Probing.
-    # Complex NATs werden separat behandelt.
     
     # Matche Probes mit den neuen Ports
     if session_id in session_manager.pending_probes:
@@ -125,7 +118,6 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
                 })
                 logger.info(f"Notified {other_peer.role} about {len(ports)} new ports from {peer.role}")
             
-            # NEU: Prüfe ob das ein Retry-Port ist (für Retry-Koordination)
             if hasattr(session, 'retry_add_ports_pending') and session.get('retry_add_ports_pending'):
                 # Finde die Connection für die wir auf add_ports warten
                 for conn_num, pending in session['retry_add_ports_pending'].items():
@@ -166,7 +158,6 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
     """Handle probes_complete message from client"""
     session_id = peer.session_id
 
-    # SCHRITT 1: Setze probes_done (entweder direkt oder nach Analyse)
     if not peer.needs_probing:
         peer.probes_done = True
         logger.info(f"Peer {peer.role} probes_done=True (no probing required)")
@@ -214,7 +205,6 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
         peer.probes_done = True
         logger.info(f"Peer {peer.role} probes_done=True")
     
-    # SCHRITT 2: Prüfe IMMER, ob beide Peers bereit sind (unabhängig vom Probe-Status)
     lock = session_manager.get_session_lock(session_id)
     async with lock:
         session = session_manager.sessions.get(session_id)
