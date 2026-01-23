@@ -172,15 +172,31 @@ async def send_peer_info_for_connection(
 def get_nat_port_for_local_port(peer, local_port: int) -> int:
     """
     Finde NAT-Port für einen gegebenen lokalen Port aus probe_ports.
-    Fallback: Verwende public_addr Port.
+    Fallback: Intelligente Vorhersage basierend auf NAT-Typ.
     """
+    # 1. Versuche exakte Übereinstimmung in probe_ports
     for lport, nport in peer.probe_ports:
         if lport == local_port:
             logger.debug(f"Found NAT port {nport} for local port {local_port}")
             return nport
     
-    # Fallback: Verwende public_addr Port
-    logger.warning(f"No probe_port found for local {local_port}, using public_addr port {peer.public_addr[1]}")
+    # 2. Port-Preserved NAT: NAT-Port = Local-Port (kein Probing nötig!)
+    if peer.nat_analysis and peer.nat_analysis.pattern_type == "port_preserved":
+        logger.debug(f"Port-Preserved NAT: predicting NAT port {local_port} for local port {local_port}")
+        return local_port
+    
+    # 3. Versuche Delta-Berechnung (falls wir mindestens ein Mapping haben)
+    if peer.probe_ports:
+        # Berechne Delta aus erstem bekannten Mapping
+        first_local, first_nat = peer.probe_ports[0]
+        delta = first_nat - first_local
+        predicted_nat = local_port + delta
+        
+        logger.info(f"Predicted NAT port {predicted_nat} for local port {local_port} (delta={delta})")
+        return predicted_nat
+    
+    # 4. Letzter Fallback: Verwende public_addr Port (nur für erste Connection)
+    logger.warning(f"No probe_port found for local {local_port}, using public_addr port {peer.public_addr[1]} (first connection fallback)")
     return peer.public_addr[1]
 
 
