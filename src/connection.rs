@@ -63,9 +63,11 @@ async fn wait_for_retry_granted(
 }
 
 /// Wartet auf ports_added_ack vom Server
+/// WICHTIG: Buffert andere Messages (PeerInfo, Go, etc.) statt sie zu verwerfen!
 async fn wait_for_ports_added_ack(
     relay_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     expected_ports: &[u16],
+    pending_lines: &mut Vec<String>,  // Buffer für nicht-verarbeitete Messages!
 ) -> Result<()> {
     let timeout = Duration::from_secs(30);
     let start = std::time::Instant::now();
@@ -76,7 +78,7 @@ async fn wait_for_ports_added_ack(
         }
         
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), relay_reader.read_line(&mut line))
+        tokio::time::timeout(Duration::from_secs(10), relay_reader.read_line(&mut line))
             .await
             .map_err(|_| anyhow!("Read timeout waiting for ports_added_ack"))??;
         
@@ -105,17 +107,57 @@ async fn wait_for_ports_added_ack(
                 return Err(anyhow!("Server error: {}", message));
             }
             _ => {
-                debug!("Skipping message while waiting for ports_added_ack: {:?}", msg);
+                // NEU: NICHT verwerfen! In Buffer speichern für spätere Verarbeitung!
+                debug!("Buffering message while waiting for ports_added_ack: {:?}", msg);
+                pending_lines.push(line);
             }
         }
     }
 }
 
 /// Wartet auf peer_info Message für eine bestimmte Connection
+/// WICHTIG: Prüft zuerst den pending_lines Buffer bevor vom Stream gelesen wird!
 pub async fn receive_peer_info_for_connection(
     relay_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     expected_conn_num: u32,
+    pending_lines: &mut Vec<String>,  // Buffer mit gebufferten Messages!
 ) -> Result<(PeerInfo, String, u32)> {
+    // 1. Prüfe zuerst den Buffer (Messages die während ACK-Wait gebuffert wurden!)
+    let mut i = 0;
+    while i < pending_lines.len() {
+        let line = &pending_lines[i];
+        if let Ok(msg) = serde_json::from_str::<RelayMessage>(line) {
+            match msg {
+                RelayMessage::PeerInfo { connection_num, punch_strategy, peer_public_addr, peer_addresses, peer_nat_analysis, tcp_connections, .. } => {
+                    let conn = connection_num.unwrap_or(0);
+                    if conn == expected_conn_num {
+                        // Gefunden im Buffer! Entferne und verwende.
+                        pending_lines.remove(i);
+                        debug!("Found peer_info for conn {} in message buffer!", conn);
+                        
+                        let strategy = punch_strategy.unwrap_or_else(|| "scan".to_string());
+                        let peer_tcp_connections = tcp_connections.unwrap_or(1);
+                        
+                        let peer_addr = RelayMessage::parse_addr(&peer_public_addr)
+                            .ok_or_else(|| anyhow!("Invalid peer address"))?;
+                        let peer_addr: SocketAddr = format!("{}:{}", peer_addr.0, peer_addr.1).parse()?;
+                        
+                        let peer_info = PeerInfo {
+                            peer_addr,
+                            peer_addresses,
+                            peer_nat_analysis,
+                        };
+                        
+                        return Ok((peer_info, strategy, peer_tcp_connections));
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    
+    // 2. Nicht im Buffer → Lese vom Stream
     loop {
         let mut line = String::new();
         let _ = tokio::time::timeout(Duration::from_secs(120), relay_reader.read_line(&mut line))
@@ -133,14 +175,14 @@ pub async fn receive_peer_info_for_connection(
             RelayMessage::PeerInfo { connection_num, punch_strategy, peer_public_addr, peer_addresses, peer_nat_analysis, tcp_connections, .. } => {
                 let conn = connection_num.unwrap_or(0);
                 if conn != expected_conn_num {
-                    warn!("Received peer_info for conn {} but expected {}, skipping", conn, expected_conn_num);
+                    warn!("Received peer_info for conn {} but expected {}, buffering", conn, expected_conn_num);
+                    pending_lines.push(line);
                     continue;
                 }
                 
                 let strategy = punch_strategy.unwrap_or_else(|| "scan".to_string());
-                let peer_tcp_connections = tcp_connections.unwrap_or(1);  // Default: 1 Connection
+                let peer_tcp_connections = tcp_connections.unwrap_or(1);
                 
-                // Baue PeerInfo-Struct
                 let peer_addr = RelayMessage::parse_addr(&peer_public_addr)
                     .ok_or_else(|| anyhow!("Invalid peer address"))?;
                 let peer_addr: SocketAddr = format!("{}:{}", peer_addr.0, peer_addr.1).parse()?;
@@ -157,7 +199,6 @@ pub async fn receive_peer_info_for_connection(
                 return Err(anyhow!("Server error: {}", message));
             }
             _ => {
-                // Andere Messages ignorieren oder verarbeiten
                 debug!("Skipping message while waiting for peer_info: {:?}", msg);
             }
         }
@@ -216,6 +257,7 @@ pub async fn establish_multi_connections(
 ) -> Result<Vec<TcpStream>> {
     let mut streams = Vec::new();
     let mut failures_in_a_row = 0;
+    let mut pending_lines: Vec<String> = Vec::new();  // Message-Buffer für Race-Condition-Schutz!
     const MAX_FAILURES: u32 = 5;
     
     // Für Receiver: Empfange ERSTE peer_info VOR der Schleife!
@@ -225,7 +267,8 @@ pub async fn establish_multi_connections(
         // 1. Warte auf peer_info für conn=0
         let (peer_info, punch_strategy, peer_tcp_connections) = receive_peer_info_for_connection(
             &mut relay_reader,
-            0
+            0,
+            &mut pending_lines,
         ).await?;
         
         info!("✓ Received initial peer_info: peer wants {} connections", peer_tcp_connections);
@@ -314,7 +357,7 @@ pub async fn establish_multi_connections(
                     info!("✓ Sent add_ports message");
                     
                     // Wait for ACK
-                    match wait_for_ports_added_ack(&mut relay_reader, &new_ports).await {
+                    match wait_for_ports_added_ack(&mut relay_reader, &new_ports, &mut pending_lines).await {
                         Ok(_) => info!("✓ New ports confirmed by server"),
                         Err(e) => warn!("⚠️ Failed to get ACK for new ports: {}", e),
                     }
@@ -356,7 +399,7 @@ pub async fn establish_multi_connections(
                         info!("📤 Sent add_ports for new socket {}", new_port);
                         
                         // Warte auf ACK
-                        match wait_for_ports_added_ack(&mut relay_reader, &[new_port]).await {
+                        match wait_for_ports_added_ack(&mut relay_reader, &[new_port], &mut pending_lines).await {
                             Ok(_) => info!("✓ New port {} confirmed by server", new_port),
                             Err(e) => warn!("⚠️ Failed to get ACK for new port {}: {}", new_port, e),
                         }
@@ -381,7 +424,8 @@ pub async fn establish_multi_connections(
             // 1. Warte auf peer_info für diese Connection
             let (peer_info, punch_strategy, _peer_tcp_connections) = match receive_peer_info_for_connection(
                 &mut relay_reader,
-                conn_num
+                conn_num,
+                &mut pending_lines,
             ).await {
                 Ok(data) => data,
                 Err(e) => {
@@ -486,7 +530,7 @@ pub async fn establish_multi_connections(
                                         info!("📤 Sent add_ports for retry socket {}", new_port);
                                         
                                         // Warte auf ACK
-                                        match wait_for_ports_added_ack(&mut relay_reader, &[new_port]).await {
+                                        match wait_for_ports_added_ack(&mut relay_reader, &[new_port], &mut pending_lines).await {
                                             Ok(_) => info!("✓ New port {} confirmed by server", new_port),
                                             Err(e) => warn!("⚠️ Failed to get ACK for new port {}: {}", new_port, e),
                                         }

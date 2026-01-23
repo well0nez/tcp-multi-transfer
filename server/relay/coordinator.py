@@ -46,6 +46,25 @@ async def coordinate_multi_connections(
     for conn_num in range(tcp_connections):
         logger.info(f"Session {session_id}: Coordinating connection {conn_num+1}/{tcp_connections}")
         
+        # 0. NEU: Warte bis BEIDE Peers genug Ports für diese Connection haben!
+        # Das stellt sicher, dass peer_info den RICHTIGEN Port enthält.
+        max_port_wait = 60.0  # Max 60s warten auf Ports
+        port_wait_start = time.time()
+        while True:
+            sender_has_port = conn_num < len(sender.bound_ports)
+            receiver_has_port = conn_num < len(receiver.bound_ports)
+            
+            if sender_has_port and receiver_has_port:
+                logger.debug(f"Session {session_id}: Both peers have port for connection {conn_num}")
+                break
+            
+            if time.time() - port_wait_start > max_port_wait:
+                logger.error(f"Session {session_id}: Timeout waiting for ports (conn {conn_num}) - "
+                           f"sender={len(sender.bound_ports)} ports, receiver={len(receiver.bound_ports)} ports")
+                return
+            
+            await asyncio.sleep(0.05)  # Kurzes Polling (50ms)
+        
         # 1. Sende peer_info für diese Connection
         await send_peer_info_for_connection(
             session_id,
@@ -57,10 +76,7 @@ async def coordinate_multi_connections(
         )
         
         # 2. Warte auf BEIDE READYs
-        # Dynamisches Timeout: Mehr Connections = mehr Zeit für Receiver-Probing
-        # Base: 30s, +15s pro zusätzlicher Connection (für Binding + Probing)
-        max_wait = 30.0 + (tcp_connections - 1) * 15.0
-        logger.debug(f"Session {session_id}: Using dynamic timeout {max_wait:.1f}s for {tcp_connections} connections")
+        max_wait = 60.0  # Festes 60s Timeout (keine zeitbasierte Heuristik mehr!)
         start_wait = time.time()
         
         while True:
@@ -97,9 +113,11 @@ async def coordinate_multi_connections(
             sender.ready_for_connection[conn_num] = False
             receiver.ready_for_connection[conn_num] = False
         
-        # 5. Warte mindestens 2 Sekunden vor nächster Connection
-        if conn_num < tcp_connections - 1:  # Nicht nach letzter Connection
-            await asyncio.sleep(2.5)  # 2s Pause + 0.5s Buffer
+        # 5. KEINE feste Pause mehr! Port-Synchronisation (Schritt 0) stellt sicher,
+        # dass der nächste Port verfügbar ist bevor peer_info gesendet wird.
+        # Nur minimale Pause für Message-Processing:
+        if conn_num < tcp_connections - 1:
+            await asyncio.sleep(0.1)  # Minimale Pause für Message-Ordering
 
 
 async def send_peer_info_for_connection(

@@ -77,8 +77,8 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
     # Speichere die neuen Ports
     peer.bound_ports.extend(ports)
     
-    # Warte kurz auf eingehende Probes für die neuen Ports
-    await asyncio.sleep(0.5)  # Gib Client Zeit, Probes zu senden
+    # KEIN Sleep mehr! Port-Preserved NATs brauchen kein Probing.
+    # Complex NATs werden separat behandelt.
     
     # Matche Probes mit den neuen Ports
     if session_id in session_manager.pending_probes:
