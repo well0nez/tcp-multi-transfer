@@ -128,7 +128,9 @@ async fn punch_connect(
     }
 }
 
-/// SCAN-Modus: Scannt Port-Range parallel mit Listener
+/// SCAN-Modus: Scannt Peer-Adressen PARALLEL mit Listener
+/// 
+/// Basierend auf Original-Implementation: Ein Task PRO peer_address!
 async fn punch_scan(
     socket: socket2::Socket,
     peer_info: &PeerInfo,
@@ -146,34 +148,41 @@ async fn punch_scan(
         tokio::time::sleep(Duration::from_secs_f64(wait_time)).await;
     }
     
-    // Nutze peer_addresses für Port-Range (enthält PUBLIC Ports!)
-    // peer_nat_analysis enthält lokale Ports - NICHT für Scan nutzen!
-    let ports: Vec<u16> = peer_info.peer_addresses.iter().map(|a| a.port).collect();
-    if ports.is_empty() {
-        return Err(anyhow!("No scan range available (peer_addresses empty)"));
+    // Sammle alle Peer-Adressen (enthält PUBLIC Ports!)
+    let mut peer_addresses: Vec<SocketAddr> = Vec::new();
+    for addr_info in &peer_info.peer_addresses {
+        if let Ok(addr) = format!("{}:{}", addr_info.ip, addr_info.port).parse::<SocketAddr>() {
+            if !peer_addresses.contains(&addr) {
+                peer_addresses.push(addr);
+            }
+        }
     }
-    let (scan_start, scan_end) = (*ports.iter().min().unwrap(), *ports.iter().max().unwrap());
     
-    let peer_ip = peer_info.peer_addr.ip();
-    let port_count = scan_end.saturating_sub(scan_start).saturating_add(1);
-    info!("🔍 SCAN mode: Scanning {}:{}-{} ({} ports)", peer_ip, scan_start, scan_end, port_count);
-    debug!("SCAN: peer_nat_analysis = {:?}", peer_info.peer_nat_analysis);
+    if peer_addresses.is_empty() {
+        return Err(anyhow!("No peer addresses available"));
+    }
     
-    // Simultaneous Scan: Listener + Connector
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
+    info!("🔍 SCAN mode: Trying {} unique addresses", peer_addresses.len());
+    debug!("SCAN: peer_addresses = {:?}", peer_addresses);
     
-    // Listener Task
+    // Listener Setup
     let listener_socket = socket.try_clone()?;
     listener_socket.listen(128)?;
     let std_listener: std::net::TcpListener = listener_socket.into();
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
+    let listener_local_port = listener.local_addr()?.port();
     
+    // Channel für Kandidaten
+    let channel_capacity = peer_addresses.len().saturating_add(2).max(4);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(channel_capacity);
+    
+    // Listener Task
     let listener_tx = tx.clone();
     let listener_handle = tokio::spawn(async move {
         loop {
-            match tokio::time::timeout(Duration::from_secs(5), listener.accept()).await {
-                Ok(Ok((mut stream, peer_addr))) => {
+            match listener.accept().await {
+                Ok((mut stream, peer_addr)) => {
                     debug!("SCAN: Accepted from {}", peer_addr);
                     stream.set_nodelay(true).ok();
                     if pre_handshake(&mut stream).await.is_ok() {
@@ -181,86 +190,136 @@ async fn punch_scan(
                         break;
                     }
                 }
-                Ok(Err(_)) => tokio::time::sleep(Duration::from_millis(10)).await,
-                Err(_) => break,  // Timeout
+                Err(e) => {
+                    debug!("SCAN: Accept error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
         }
     });
     
-    // Scanner Task
-    let connector_tx = tx.clone();
-    let local_port = socket.local_addr().map(|a| a.as_socket().unwrap().port()).unwrap_or(0);
-    let connector_handle = tokio::spawn(async move {
-        let start = tokio::time::Instant::now();
-        debug!("SCAN: Starting connector task for ports {}-{}", scan_start, scan_end);
+    // Connector Tasks - EIN TASK PRO PEER_ADDRESS! (PARALLEL!)
+    let local_port = listener_local_port;
+    let total_addrs = peer_addresses.len();
+    let connector_handles: Vec<_> = peer_addresses.into_iter().enumerate().map(|(idx, peer_addr)| {
+        let connector_tx = tx.clone();
+        let timeout = timeout;
         
-        for port in scan_start..=scan_end {
-            debug!("SCAN: Trying port {}", port);
-            if start.elapsed() >= timeout {
-                break;
-            }
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let mut attempt = 0;
             
-            let socket = match create_hole_punch_socket() {
-                Ok(s) => s,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+            while start.elapsed() < timeout {
+                attempt += 1;
+                
+                // Erstelle neuen Socket für diesen Versuch
+                let socket = match create_hole_punch_socket() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!("SCAN[{}]: Failed to create socket: {}", idx, e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                
+                // CRITICAL: Bind zu unserem local_port!
+                if let Err(e) = bind_to_port(&socket, local_port) {
+                    debug!("SCAN[{}]: Failed to bind: {}", idx, e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
-            };
-            
-            if bind_to_port(&socket, local_port).is_err() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            
-            socket.set_nonblocking(true).ok();
-            
-            let target_addr: SocketAddr = format!("{}:{}", peer_ip, port).parse().unwrap();
-            debug!("SCAN: Connecting to {}", target_addr);
-            
-            match socket.connect(&socket2::SockAddr::from(target_addr)) {
-                Ok(()) | Err(_) => {
-                    let std_stream: std::net::TcpStream = socket.into();
-                    if let Ok(mut stream) = TcpStream::from_std(std_stream) {
-                        if wait_for_connect_async(&mut stream, Duration::from_millis(500)).await.is_ok() {
+                
+                socket.set_nonblocking(true).ok();
+                
+                // Versuche zu connecten
+                let connect_result = socket.connect(&socket2::SockAddr::from(peer_addr));
+                
+                match connect_result {
+                    Ok(()) => {
+                        // Immediate success
+                        let std_stream: std::net::TcpStream = socket.into();
+                        if let Ok(mut stream) = TcpStream::from_std(std_stream) {
                             if pre_handshake(&mut stream).await.is_ok() {
-                                info!("✅ SCAN: Connected to {}:{}", peer_ip, port);
+                                info!("✅ SCAN: Connected to {} (addr {}/{})", peer_addr, idx + 1, total_addrs);
                                 let _ = connector_tx.send(stream).await;
                                 return;
-                            } else {
-                                debug!("SCAN: Pre-handshake failed for {}:{}", peer_ip, port);
                             }
-                        } else {
-                            debug!("SCAN: Connect timeout for {}:{}", peer_ip, port);
                         }
-                    } else {
-                        debug!("SCAN: Failed to create TcpStream for {}:{}", peer_ip, port);
+                    }
+                    Err(e) => {
+                        // Check if "in progress" (expected for non-blocking)
+                        #[cfg(unix)]
+                        let is_in_progress = e.raw_os_error() == Some(libc::EINPROGRESS)
+                            || e.kind() == std::io::ErrorKind::WouldBlock;
+                        #[cfg(not(unix))]
+                        let is_in_progress = e.kind() == std::io::ErrorKind::WouldBlock;
+                        
+                        if is_in_progress {
+                            let std_stream: std::net::TcpStream = socket.into();
+                            if let Ok(mut stream) = wait_for_connect(std_stream, Duration::from_millis(500)).await {
+                                if pre_handshake(&mut stream).await.is_ok() {
+                                    info!("✅ SCAN: Connected to {} (addr {}/{})", peer_addr, idx + 1, total_addrs);
+                                    let _ = connector_tx.send(stream).await;
+                                    return;
+                                }
+                            }
+                        } else if attempt % 20 == 0 {
+                            debug!("SCAN[{}]: Attempt {} to {} failed: {}", idx, attempt, peer_addr, e);
+                        }
                     }
                 }
+                
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        debug!("SCAN: Connector task finished after {:.3}s", start.elapsed().as_secs_f64());
-    });
+            debug!("SCAN[{}]: Timed out after {} attempts to {}", idx, attempt, peer_addr);
+        })
+    }).collect();
     
     drop(tx);
     
     // Warte auf ersten erfolgreichen Stream
     let scan_start_time = tokio::time::Instant::now();
-    match tokio::time::timeout(timeout + Duration::from_secs(1), rx.recv()).await {
+    let timeout_duration = timeout + Duration::from_secs(1);
+    
+    match tokio::time::timeout(timeout_duration, rx.recv()).await {
         Ok(Some(stream)) => {
             listener_handle.abort();
-            connector_handle.abort();
+            for h in connector_handles {
+                h.abort();
+            }
             info!("✅ SCAN: Connection established after {:.3}s", scan_start_time.elapsed().as_secs_f64());
             Ok(stream)
         }
         _ => {
             listener_handle.abort();
-            connector_handle.abort();
+            for h in connector_handles {
+                h.abort();
+            }
             let elapsed = scan_start_time.elapsed().as_secs_f64();
             Err(anyhow!("SCAN timeout after {:.1}s (configured: {:?})", elapsed, timeout))
         }
+    }
+}
+
+/// Helper: Warte auf erfolgreichen Connect (für non-blocking sockets)
+async fn wait_for_connect(stream: std::net::TcpStream, timeout: Duration) -> Result<TcpStream> {
+    use tokio::io::Interest;
+    
+    let stream = TcpStream::from_std(stream)?;
+    
+    match tokio::time::timeout(timeout, stream.ready(Interest::WRITABLE)).await {
+        Ok(Ok(_)) => {
+            match stream.peer_addr() {
+                Ok(_) => {
+                    stream.set_nodelay(true)?;
+                    Ok(stream)
+                }
+                Err(e) => Err(anyhow!("Connection failed: {}", e))
+            }
+        }
+        Ok(Err(e)) => Err(anyhow!("Ready check failed: {}", e)),
+        Err(_) => Err(anyhow!("Connection timeout")),
     }
 }
 

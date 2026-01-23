@@ -53,22 +53,16 @@ def get_peer_addresses_with_prediction(peer, other, max_scan_ports: int) -> List
             'priority': priority
         })
     
-    # 1. Primary public address
+    # 1. Primary public address (IMMER!)
     add_address(peer.public_addr[0], peer.public_addr[1], 'public', 1)
 
-    # 2. Predicted port (delta-based)
-    if peer.nat_analysis and peer.nat_analysis.predicted_port:
-        add_address(peer.public_addr[0], peer.nat_analysis.predicted_port, 'predicted', 2)
-
-    # 3. Public IP + local port (if different)
-    if peer.local_port and peer.local_port != peer.public_addr[1]:
-        add_address(peer.public_addr[0], peer.local_port, 'public_local_port', 3)
-
-    # 4. Predicted range from NAT analysis (capped)
+    # 2. Für COMPLEX NAT (needs_scan): Port-Range aus NAT-Analyse
     if peer.nat_analysis and peer.nat_analysis.needs_scan:
         scan_ports = build_candidate_ports(peer.nat_analysis, max_scan_ports)
         for i, port in enumerate(scan_ports):
-            add_address(peer.public_addr[0], port, 'predicted_range', 10 + i)
+            # Nur Ports hinzufügen, die NICHT bereits der PRIMARY Port sind
+            if port != peer.public_addr[1]:
+                add_address(peer.public_addr[0], port, 'predicted_range', 10 + i)
     
     # Sort by priority
     addresses.sort(key=lambda x: x.get('priority', 999))
