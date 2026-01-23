@@ -159,7 +159,9 @@ async fn punch_scan(
     };
     
     let peer_ip = peer_info.peer_addr.ip();
-    info!("🔍 SCAN mode: Scanning {}:{}-{}", peer_ip, scan_start, scan_end);
+    let port_count = scan_end.saturating_sub(scan_start).saturating_add(1);
+    info!("🔍 SCAN mode: Scanning {}:{}-{} ({} ports)", peer_ip, scan_start, scan_end, port_count);
+    debug!("SCAN: peer_nat_analysis = {:?}", peer_info.peer_nat_analysis);
     
     // Simultaneous Scan: Listener + Connector
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(1);
@@ -194,8 +196,10 @@ async fn punch_scan(
     let local_port = socket.local_addr().map(|a| a.as_socket().unwrap().port()).unwrap_or(0);
     let connector_handle = tokio::spawn(async move {
         let start = tokio::time::Instant::now();
+        debug!("SCAN: Starting connector task for ports {}-{}", scan_start, scan_end);
         
         for port in scan_start..=scan_end {
+            debug!("SCAN: Trying port {}", port);
             if start.elapsed() >= timeout {
                 break;
             }
@@ -216,6 +220,7 @@ async fn punch_scan(
             socket.set_nonblocking(true).ok();
             
             let target_addr: SocketAddr = format!("{}:{}", peer_ip, port).parse().unwrap();
+            debug!("SCAN: Connecting to {}", target_addr);
             
             match socket.connect(&socket2::SockAddr::from(target_addr)) {
                 Ok(()) | Err(_) => {
@@ -223,33 +228,42 @@ async fn punch_scan(
                     if let Ok(mut stream) = TcpStream::from_std(std_stream) {
                         if wait_for_connect_async(&mut stream, Duration::from_millis(500)).await.is_ok() {
                             if pre_handshake(&mut stream).await.is_ok() {
-                                debug!("SCAN: Connected to {}:{}", peer_ip, port);
+                                info!("✅ SCAN: Connected to {}:{}", peer_ip, port);
                                 let _ = connector_tx.send(stream).await;
                                 return;
+                            } else {
+                                debug!("SCAN: Pre-handshake failed for {}:{}", peer_ip, port);
                             }
+                        } else {
+                            debug!("SCAN: Connect timeout for {}:{}", peer_ip, port);
                         }
+                    } else {
+                        debug!("SCAN: Failed to create TcpStream for {}:{}", peer_ip, port);
                     }
                 }
             }
             
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        debug!("SCAN: Connector task finished after {:.3}s", start.elapsed().as_secs_f64());
     });
     
     drop(tx);
     
     // Warte auf ersten erfolgreichen Stream
+    let scan_start_time = tokio::time::Instant::now();
     match tokio::time::timeout(timeout + Duration::from_secs(1), rx.recv()).await {
         Ok(Some(stream)) => {
             listener_handle.abort();
             connector_handle.abort();
-            info!("✅ SCAN: Connection established");
+            info!("✅ SCAN: Connection established after {:.3}s", scan_start_time.elapsed().as_secs_f64());
             Ok(stream)
         }
         _ => {
             listener_handle.abort();
             connector_handle.abort();
-            Err(anyhow!("SCAN timeout after {:?}", timeout))
+            let elapsed = scan_start_time.elapsed().as_secs_f64();
+            Err(anyhow!("SCAN timeout after {:.1}s (configured: {:?})", elapsed, timeout))
         }
     }
 }
