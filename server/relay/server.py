@@ -140,6 +140,9 @@ class TCPRelayServerICE:
                 logger.warning(f"Invalid prediction_range_extra_pct '{range_raw}', defaulting to 0.0")
                 prediction_range_extra_pct = 0.0
             
+            # Extract tcp_connections from register message
+            tcp_connections = msg.get('tcp_connections', 1)
+            
             if role not in ('sender', 'receiver'):
                 await send_error(writer, f"Invalid role: {role}")
                 return
@@ -154,6 +157,7 @@ class TCPRelayServerICE:
                 private_ip=private_ip,
                 prediction_mode=prediction_mode,
                 prediction_range_extra_pct=prediction_range_extra_pct,
+                tcp_connections=tcp_connections,
             )
             
             lock = self.session_manager.get_session_lock(session_id)
