@@ -146,17 +146,13 @@ async fn punch_scan(
         tokio::time::sleep(Duration::from_secs_f64(wait_time)).await;
     }
     
-    // Hole scan_start und scan_end aus NAT-Analyse
-    let (scan_start, scan_end) = if let Some(ref nat) = peer_info.peer_nat_analysis {
-        (nat.scan_start, nat.scan_end)
-    } else {
-        // Fallback: Nutze peer_addresses
-        let ports: Vec<u16> = peer_info.peer_addresses.iter().map(|a| a.port).collect();
-        if ports.is_empty() {
-            return Err(anyhow!("No scan range available"));
-        }
-        (*ports.iter().min().unwrap(), *ports.iter().max().unwrap())
-    };
+    // Nutze peer_addresses für Port-Range (enthält PUBLIC Ports!)
+    // peer_nat_analysis enthält lokale Ports - NICHT für Scan nutzen!
+    let ports: Vec<u16> = peer_info.peer_addresses.iter().map(|a| a.port).collect();
+    if ports.is_empty() {
+        return Err(anyhow!("No scan range available (peer_addresses empty)"));
+    }
+    let (scan_start, scan_end) = (*ports.iter().min().unwrap(), *ports.iter().max().unwrap());
     
     let peer_ip = peer_info.peer_addr.ip();
     let port_count = scan_end.saturating_sub(scan_start).saturating_add(1);

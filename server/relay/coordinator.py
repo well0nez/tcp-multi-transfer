@@ -178,12 +178,9 @@ def determine_punch_strategy(my_peer, other_peer) -> str:
     if my_friendly and other_friendly:
         # Beide NAT-friendly: Einer listet, einer connected
         return "connect" if my_peer.role == "sender" else "listen"
-    elif my_friendly and not other_friendly:
-        # Ich friendly, Peer complex: Ich LISTE auf festem Port, Peer scannt mich
-        return "listen"
-    elif not my_friendly and other_friendly:
-        # Ich complex, Peer friendly: Ich SCANNE die (meist kleine) Port-Range des Peers
-        return "scan"
     else:
-        # Beide complex: Beide SCANNEN + LISTEN parallel (simultaneous open)
+        # ALLE ANDEREN FÄLLE: SCAN (mit Listener parallel!)
+        # - Mixed (friendly + complex): Beide müssen scannen UND lauschen
+        # - Beide complex: Beide müssen scannen UND lauschen
+        # SCAN = Simultaneous Open (Scanner + Listener parallel)
         return "scan"
