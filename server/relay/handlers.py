@@ -266,9 +266,27 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager):
             sender.ready_for_connection[conn_num] = False
             receiver.ready_for_connection[conn_num] = False
             
-            logger.info(f"Session {session_id}: Retry granted for connection {conn_num}, waiting for new add_ports and READYs")
+            logger.info(f"Session {session_id}: Retry granted for connection {conn_num}, waiting for new add_ports")
             
-            # Jetzt warten beide Clients auf neue peer_info (nach add_ports)
-            # Der Coordinator wird neue peer_info senden wenn beide READY sind
+            # Warte kurz auf add_ports von beiden (0.5s sollte reichen)
+            await asyncio.sleep(0.5)
+            
+            # Sende NEUE peer_info mit aktualisierten Ports!
+            from .coordinator import send_peer_info_for_connection
+            
+            # Ermittle max_scan_ports (aus Session-Config oder Default)
+            max_scan_ports = sender.scan_budget or receiver.scan_budget or 100
+            
+            logger.info(f"Session {session_id}: Sending updated peer_info for connection {conn_num} after retry")
+            await send_peer_info_for_connection(
+                session_id,
+                sender,
+                receiver,
+                conn_num,
+                max_scan_ports,
+                session_manager
+            )
+            
+            logger.info(f"Session {session_id}: Updated peer_info sent, waiting for new READYs")
         else:
             logger.info(f"Session {session_id}: Waiting for other peer to request retry for connection {conn_num}")
