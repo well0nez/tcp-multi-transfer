@@ -11,7 +11,7 @@ use tracing::{info, error, warn, debug};
 
 use crate::protocol::{RelayMessage, AddPortsMessage};
 use crate::punch::{punch_connection_with_strategy, PeerInfo, current_timestamp};
-use crate::relay::{Session, create_bound_socket, probe_new_ports};
+use crate::relay::{Session, create_bound_socket};
 
 /// GO Signal mit Zeitstempel
 pub struct GoSignal {
@@ -328,6 +328,53 @@ pub async fn establish_multi_connections(
     
     // Hauptschleife für verbleibende Connections
     for conn_num in start_conn..actual_tcp_connections {
+        // 0. ON-DEMAND Socket Binding: VORHER binden, damit Server den richtigen Port kennt!
+        let socket_index = conn_num as usize;
+        if socket_index >= session.bound_sockets.len() {
+            // Berechne nächsten Port (mit Retry für Windows Port-Konflikte)
+            let base_port = if let Some(last) = session.bound_sockets.last() {
+                last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
+            } else {
+                return Err(anyhow!("No initial socket available"));
+            };
+            
+            // Bind mit Port-Range-Retry (Windows: os error 10013 bei belegten Ports)
+            let mut bound = false;
+            for port_offset in 0u16..50 {
+                let try_port = base_port.wrapping_add(port_offset);
+                match create_bound_socket(try_port) {
+                    Ok(new_socket) => {
+                        let new_port = new_socket.local_addr()?.as_socket().map(|s| s.port()).unwrap_or(try_port);
+                        session.bound_sockets.push(new_socket);
+                        info!("🔧 On-demand: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
+                        
+                        // Sende add_ports an Server (OHNE Probing!)
+                        let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
+                        let json = serde_json::to_string(&add_msg)? + "\n";
+                        relay_writer.write_all(json.as_bytes()).await?;
+                        relay_writer.flush().await?;
+                        info!("📤 Sent add_ports for new socket {}", new_port);
+                        
+                        // Warte auf ACK
+                        match wait_for_ports_added_ack(&mut relay_reader, &[new_port]).await {
+                            Ok(_) => info!("✓ New port {} confirmed by server", new_port),
+                            Err(e) => warn!("⚠️ Failed to get ACK for new port {}: {}", new_port, e),
+                        }
+                        bound = true;
+                        break;
+                    }
+                    Err(e) => {
+                        if port_offset == 0 {
+                            debug!("Port {} unavailable: {}, trying next...", try_port, e);
+                        }
+                    }
+                }
+            }
+            if !bound {
+                return Err(anyhow!("Failed to bind socket for connection {} (tried 50 ports from {})", conn_num + 1, base_port));
+            }
+        }
+        
         info!("📡 Waiting for peer_info for connection {}/{}...", conn_num + 1, actual_tcp_connections);
         
         loop {  // Retry-Loop für diese Connection
@@ -371,44 +418,7 @@ pub async fn establish_multi_connections(
             let countdown = go_signal.start_at - current_timestamp();
             info!("✓ GO received for connection {}! Start in {:.2}s", conn_num + 1, countdown);
             
-            // 4. ON-DEMAND Socket Binding: Bind Socket nur wenn nötig!
-            let socket_index = conn_num as usize;
-            
-            // NEU: Prüfe ob Socket existiert, sonst bind neuen!
-            if socket_index >= session.bound_sockets.len() {
-                // Berechne nächsten Port
-                let next_port = if let Some(last) = session.bound_sockets.last() {
-                    last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
-                } else {
-                    return Err(anyhow!("No initial socket available"));
-                };
-                
-                // Bind EINEN neuen Socket
-                match create_bound_socket(next_port) {
-                    Ok(new_socket) => {
-                        let new_port = new_socket.local_addr()?.as_socket().map(|s| s.port()).unwrap_or(next_port);
-                        session.bound_sockets.push(new_socket);
-                        info!("🔧 On-demand: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
-                        
-                        // Sende add_ports (OHNE Probing!)
-                        let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
-                        let json = serde_json::to_string(&add_msg)? + "\n";
-                        relay_writer.write_all(json.as_bytes()).await?;
-                        relay_writer.flush().await?;
-                        info!("📤 Sent add_ports for new socket {} (no probing!)", new_port);
-                        
-                        // Warte auf ACK
-                        match wait_for_ports_added_ack(&mut relay_reader, &[new_port]).await {
-                            Ok(_) => info!("✓ New port {} confirmed by server", new_port),
-                            Err(e) => warn!("⚠️ Failed to get ACK for new port {}: {}", new_port, e),
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Failed to bind socket for connection {}: {}", conn_num, e));
-                    }
-                }
-            }
-            
+            // Socket ist bereits gebunden (am Anfang der Schleife)
             match punch_connection_with_strategy(
                 session.bound_sockets[socket_index].try_clone()?,
                 &peer_info,
@@ -445,46 +455,59 @@ pub async fn establish_multi_connections(
                         Ok(true) => {
                             info!("✓ Retry granted by server for connection {}", conn_num + 1);
                             
-                            // 3. Bind NEUEN Socket (alter Port ist tot!)
-                            let next_port = if let Some(last) = session.bound_sockets.last() {
+                            // 3. Bind NEUEN Socket mit Port-Range-Retry (Windows: os error 10013)
+                            let base_port = if let Some(last) = session.bound_sockets.last() {
                                 last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
                             } else {
                                 return Err(anyhow!("No socket available for retry"));
                             };
                             
-                            match create_bound_socket(next_port) {
-                                Ok(new_socket) => {
-                                    let new_port = new_socket.local_addr()?.as_socket().map(|s| s.port()).unwrap_or(next_port);
-                                    
-                                    // Ersetze alten Socket mit neuem
-                                    if socket_index < session.bound_sockets.len() {
-                                        session.bound_sockets[socket_index] = new_socket;
-                                    } else {
-                                        session.bound_sockets.push(new_socket);
+                            let mut retry_bound = false;
+                            for port_offset in 0u16..50 {
+                                let try_port = base_port.wrapping_add(port_offset);
+                                match create_bound_socket(try_port) {
+                                    Ok(new_socket) => {
+                                        let new_port = new_socket.local_addr()?.as_socket().map(|s| s.port()).unwrap_or(try_port);
+                                        
+                                        // Ersetze alten Socket mit neuem
+                                        if socket_index < session.bound_sockets.len() {
+                                            session.bound_sockets[socket_index] = new_socket;
+                                        } else {
+                                            session.bound_sockets.push(new_socket);
+                                        }
+                                        
+                                        info!("🔧 Retry: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
+                                        
+                                        // 4. Sende add_ports mit neuem Port
+                                        let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
+                                        let json = serde_json::to_string(&add_msg)? + "\n";
+                                        relay_writer.write_all(json.as_bytes()).await?;
+                                        relay_writer.flush().await?;
+                                        info!("📤 Sent add_ports for retry socket {}", new_port);
+                                        
+                                        // Warte auf ACK
+                                        match wait_for_ports_added_ack(&mut relay_reader, &[new_port]).await {
+                                            Ok(_) => info!("✓ New port {} confirmed by server", new_port),
+                                            Err(e) => warn!("⚠️ Failed to get ACK for new port {}: {}", new_port, e),
+                                        }
+                                        
+                                        retry_bound = true;
+                                        break;
                                     }
-                                    
-                                    info!("🔧 Retry: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
-                                    
-                                    // 4. Sende add_ports mit neuem Port
-                                    let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
-                                    let json = serde_json::to_string(&add_msg)? + "\n";
-                                    relay_writer.write_all(json.as_bytes()).await?;
-                                    relay_writer.flush().await?;
-                                    info!("📤 Sent add_ports for retry socket {}", new_port);
-                                    
-                                    // Warte auf ACK
-                                    match wait_for_ports_added_ack(&mut relay_reader, &[new_port]).await {
-                                        Ok(_) => info!("✓ New port {} confirmed by server", new_port),
-                                        Err(e) => warn!("⚠️ Failed to get ACK for new port {}: {}", new_port, e),
+                                    Err(e) => {
+                                        if port_offset == 0 {
+                                            debug!("Retry: Port {} unavailable: {}, trying next...", try_port, e);
+                                        }
                                     }
-                                    
-                                    // 5. Loop wiederholt → Warte auf neue peer_info (mit neuem Port!)
-                                }
-                                Err(e) => {
-                                    error!("Failed to bind new socket for retry: {}", e);
-                                    continue;
                                 }
                             }
+                            
+                            if !retry_bound {
+                                error!("Failed to bind new socket for retry (tried 50 ports from {})", base_port);
+                                continue;
+                            }
+                            
+                            // 5. Loop wiederholt → Warte auf neue peer_info (mit neuem Port!)
                         }
                         Ok(false) | Err(_) => {
                             warn!("Retry not granted for connection {}", conn_num + 1);

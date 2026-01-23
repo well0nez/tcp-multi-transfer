@@ -10,7 +10,7 @@ use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 use anyhow::{Result, anyhow};
 use tracing::{info, warn, debug};
 
-use crate::protocol::{RegisterMessage, RelayMessage, ProbeMessage, AddPortsMessage};
+use crate::protocol::{RegisterMessage, RelayMessage, ProbeMessage};
 use crate::cli::PredictionMode;
 
 /// Session state for hole punch coordination
@@ -345,7 +345,7 @@ pub async fn run_relay_protocol(
             // Multi-connection mode uses the new protocol: Registered → return → Multi-Connection Loop handles everything
             RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, same_network, peer_nat_analysis, tcp_connections, scan_budget, punch_overshoot, allow_fallback, min_connections, peer_extra_ports, .. } => {
                 if let Some((ip, port)) = RelayMessage::parse_addr(&peer_public_addr) {
-                    let addr: SocketAddr = format!(\"{}:{}\", ip, port).parse()?;
+                    let addr: SocketAddr = format!("{}:{}", ip, port).parse()?;
                     session.peer_public_addr = Some(addr);
                     session.peer_addresses = peer_addresses;
                     session.same_network = same_network;
@@ -358,18 +358,18 @@ pub async fn run_relay_protocol(
                     session.min_connections = min_connections.unwrap_or(session.min_connections);
                     session.peer_extra_ports = peer_extra_ports;
                     
-                    info!(\"✓ Peer info received! Peer: {} (local {})\", addr, peer_local_port);
+                    info!("✓ Peer info received! Peer: {} (local {})", addr, peer_local_port);
                     
-                    // REMOVED: Old "Dynamic Port Binding for Receiver" logic
-                    // This caused "out of order" messages (ports_added_ack arriving before peer_info in multi-connection loop)
+                    // REMOVED: Old Dynamic Port Binding for Receiver logic
+                    // This caused out-of-order messages (ports_added_ack arriving before peer_info in multi-connection loop)
                     // New protocol: Sockets are bound on-demand in establish_multi_connections()
                     // Retry: Sockets are bound when needed after retry_granted
                     
                     // Only send READY for backward compatibility with old single-connection protocol
-                    let msg = r#\"{\"type\":\"ready\"}\"#.to_string() + \"\\n\";
+                    let msg = r#"{"type":"ready"}"#.to_string() + "\n";
                     writer.write_all(msg.as_bytes()).await?;
                     writer.flush().await?;
-                    info!(\"✓ READY sent, waiting for GO...\");
+                    info!("✓ READY sent, waiting for GO...");
                 }
             }
             
