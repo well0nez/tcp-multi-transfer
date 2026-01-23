@@ -38,6 +38,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Socket options for hole punching
 socket2 = { version = "0.5", features = ["all"] }
 
+# Concurrent data structures
+dashmap = "5.5"
+
+# Random utilities
+rand = "0.8"
+
+# Date/time utilities
+chrono = "0.4"
+
 # Unix specific
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

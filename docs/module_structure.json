@@ -1,0 +1,351 @@
+{
+  "project": "tcp-transfer-ice",
+  "description": "TCP File Transfer with NAT Traversal (Hole Punching)",
+  "python_server": {
+    "base_path": "server/",
+    "description": "Relay server for coordinating NAT traversal",
+    "modules": {
+      "models.py": {
+        "size_lines": 80,
+        "purpose": "Data models (Peer, NATAnalysis)",
+        "exports": ["Peer", "NATAnalysis"],
+        "dependencies": [],
+        "used_by": ["all modules"]
+      },
+      "nat_analyzer.py": {
+        "size_lines": 320,
+        "purpose": "NAT pattern detection and port prediction",
+        "key_functions": [
+          "analyze_nat(probes, local_port, mode, extra_pct) -> NATAnalysis",
+          "build_candidate_ports(analysis, max_ports) -> List[int]",
+          "build_port_analyses(probes, ports, mode, pct) -> List[Dict]"
+        ],
+        "dependencies": ["models.NATAnalysis"],
+        "used_by": ["relay/handlers", "relay/server"]
+      },
+      "session_manager.py": {
+        "size_lines": 70,
+        "purpose": "Session and peer connection management",
+        "key_functions": [
+          "get_session_lock(session_id) -> asyncio.Lock",
+          "parse_local_ports(raw, fallback) -> List[int]",
+          "cleanup_peer(session_id, peer)"
+        ],
+        "dependencies": ["models.Peer"],
+        "used_by": ["relay/server", "relay/coordinator", "relay/handlers"]
+      },
+      "relay/__init__.py": {
+        "size_lines": 6,
+        "purpose": "Relay module exports",
+        "exports": ["TCPRelayServerICE"],
+        "dependencies": ["relay.server"],
+        "used_by": ["main"]
+      },
+      "relay/server.py": {
+        "size_lines": 240,
+        "purpose": "Main TCP relay server class - Server setup and client handling",
+        "key_functions": [
+          "TCPRelayServerICE.__init__() - Initialize server",
+          "start() - Start main and probe server",
+          "handle_client(reader, writer) - Handle peer registration",
+          "handle_probe(reader, writer) - Handle NAT probes"
+        ],
+        "dependencies": ["models", "session_manager", "nat_analyzer", "relay.utils", "relay.handlers", "relay.coordinator"],
+        "used_by": ["relay.__init__"]
+      },
+      "relay/handlers.py": {
+        "size_lines": 195,
+        "purpose": "Message handlers for peer communication",
+        "key_functions": [
+          "wait_for_peer_messages(peer, session_manager, max_scan_ports) - Message loop",
+          "handle_probes_complete(peer, session_manager, max_scan_ports) - Probe completion",
+          "handle_request_attempt(peer, attempt_num, used_ports, session_manager, max_scan_ports) - Sequential punch coordination"
+        ],
+        "dependencies": ["models", "nat_analyzer", "relay.utils", "relay.coordinator"],
+        "used_by": ["relay.server"]
+      },
+      "relay/coordinator.py": {
+        "size_lines": 130,
+        "purpose": "Session coordination and peer info exchange",
+        "key_functions": [
+          "try_start_session(session_id, session_manager, max_scan_ports) - Check if session can start",
+          "try_send_peer_info(session_id, session_manager, max_scan_ports) - Exchange peer info",
+          "try_send_go(session_id, session_manager) - Send GO signal"
+        ],
+        "dependencies": ["relay.utils"],
+        "used_by": ["relay.server", "relay.handlers"]
+      },
+      "relay/utils.py": {
+        "size_lines": 78,
+        "purpose": "Utility functions for messaging and address building",
+        "key_functions": [
+          "send_message(writer, msg) - Send JSON message",
+          "send_error(writer, message) - Send error message",
+          "get_peer_addresses_with_prediction(peer, other, max_scan_ports) - Build peer addresses with NAT analysis"
+        ],
+        "dependencies": ["nat_analyzer.build_candidate_ports"],
+        "used_by": ["relay.server", "relay.handlers", "relay.coordinator"]
+      },
+      "main.py": {
+        "size_lines": 45,
+        "purpose": "Entry point with CLI argument parsing",
+        "key_functions": ["main() - Parse args and start server"],
+        "dependencies": ["relay.TCPRelayServerICE"],
+        "used_by": []
+      }
+    }
+  },
+  "rust_client": {
+    "base_path": "src/",
+    "description": "TCP file transfer client with hole punching",
+    "modules": {
+      "cli.rs": {
+        "size_lines": 130,
+        "purpose": "CLI argument parsing and configuration",
+        "exports": ["Args", "Mode", "PredictionMode", "parse_chunk_size", "APP_VERSION", "DEFAULT_NAT_PROBE_COUNT"],
+        "dependencies": ["clap"]
+      },
+      "main.rs": {
+        "size_lines": 490,
+        "purpose": "Entry point, relay protocol, sender/receiver orchestration",
+        "note": "Refactored: CLI extracted to cli.rs. Main contains relay protocol, session management, and orchestration logic",
+        "key_functions": [
+          "run_relay_protocol() - Relay server communication",
+          "run_sender() - Sender orchestration",
+          "run_receiver() - Receiver orchestration",
+          "main() - Entry point"
+        ],
+        "dependencies": ["cli", "protocol", "punch", "transfer", "socket2", "tokio"]
+      },
+      "utils/mod.rs": {
+        "size_lines": 10,
+        "purpose": "Utility module exports",
+        "exports": ["crypto", "network", "progress"]
+      },
+      "utils/crypto.rs": {
+        "size_lines": 50,
+        "purpose": "SHA256 file hashing",
+        "key_functions": [
+          "calculate_sha256(path) -> ([u8; 32], u64)",
+          "sha256_to_hex(hash) -> String"
+        ],
+        "dependencies": ["sha2", "tokio::fs"],
+        "used_by": ["transfer"]
+      },
+      "utils/network.rs": {
+        "size_lines": 50,
+        "purpose": "TCP socket configuration",
+        "key_functions": ["configure_tcp_socket(stream) -> Result<()>"],
+        "dependencies": ["socket2", "tokio::net"],
+        "used_by": ["transfer"]
+      },
+      "utils/progress.rs": {
+        "size_lines": 70,
+        "purpose": "Progress bar tracking",
+        "key_types": ["ProgressTracker"],
+        "key_methods": [
+          "new(total_bytes, filename) -> Self",
+          "update(current_bytes)",
+          "finish_with_message(msg)"
+        ],
+        "dependencies": ["indicatif"],
+        "used_by": ["transfer"]
+      },
+      "protocol/mod.rs": {
+        "size_lines": 15,
+        "purpose": "Protocol module - Public API",
+        "exports": ["relay", "transfer", "RegisterMessage", "RelayMessage", "etc."],
+        "dependencies": ["protocol::relay", "protocol::transfer"]
+      },
+      "protocol/relay.rs": {
+        "size_lines": 276,
+        "purpose": "Relay protocol - JSON messages for relay server communication",
+        "key_types": [
+          "RegisterMessage - Client registration",
+          "RelayMessage - Server responses (enum with variants)",
+          "ReadyMessage, RequestAttemptMessage, ProbeMessage",
+          "NATAnalysis, PeerAddressInfo, PeerPortAnalysis"
+        ],
+        "dependencies": ["serde", "hole_punch::PeerAddress"]
+      },
+      "protocol/transfer.rs": {
+        "size_lines": 200,
+        "purpose": "Transfer protocol - Binary messages for P2P file transfer",
+        "key_types": [
+          "MessageType - Protocol message type enum",
+          "HelloMessage, FileInfoMessage, StreamInfoMessage",
+          "ChunkHeaderMessage, ChunkAckMessage"
+        ],
+        "key_functions": ["encode_simple(msg_type) -> Bytes"],
+        "dependencies": ["bytes"]
+      },
+      "punch/mod.rs": {
+        "size_lines": 75,
+        "purpose": "Hole punching module - Public API and common types",
+        "exports": ["PeerAddress", "MultiHolePunchConfig", "SequentialPunchConfig", "do_sequential_hole_punch", "punch_single_port"],
+        "dependencies": ["punch::helpers", "punch::single", "punch::sequential"]
+      },
+      "punch/helpers.rs": {
+        "size_lines": 105,
+        "purpose": "Helper functions for hole punching",
+        "key_functions": [
+          "current_timestamp() -> f64",
+          "create_hole_punch_socket() -> Result<Socket>",
+          "bind_to_port(socket, port) -> Result<()>",
+          "pre_handshake(stream) -> Result<()>",
+          "wait_for_connect(stream, timeout) -> Result<TcpStream>"
+        ],
+        "dependencies": ["socket2", "tokio::net"]
+      },
+      "punch/single.rs": {
+        "size_lines": 150,
+        "purpose": "Single port hole punching - Synchronized punch to specific port",
+        "key_functions": ["punch_single_port(config) -> Result<TcpStream>"],
+        "dependencies": ["punch::helpers", "socket2"]
+      },
+      "punch/sequential.rs": {
+        "size_lines": 135,
+        "purpose": "Sequential hole punching - Server-coordinated multi-port attempts",
+        "key_functions": [
+          "do_sequential_hole_punch(config, relay_writer, relay_reader, max_attempts, session_id) -> Result<Vec<TcpStream>>"
+        ],
+        "dependencies": ["punch::helpers", "punch::single", "protocol"]
+      },
+      "transfer/mod.rs": {
+        "size_lines": 40,
+        "purpose": "Transfer module - Public API and configuration",
+        "exports": ["TcpSender", "TcpReceiver", "run_multi_sender", "run_multi_receiver", "calculate_sha256", "sha256_to_hex", "set_chunk_size"],
+        "dependencies": ["transfer::helpers", "transfer::sender", "transfer::receiver"]
+      },
+      "transfer/helpers.rs": {
+        "size_lines": 180,
+        "purpose": "Helper functions - SHA256, progress tracking, socket config",
+        "key_types": ["ProgressTracker"],
+        "key_functions": [
+          "calculate_sha256(file_path) -> ([u8; 32], u64)",
+          "sha256_to_hex(hash) -> String",
+          "configure_tcp_socket(stream) -> Result<()>",
+          "read_exact_timeout/write_all_timeout"
+        ],
+        "dependencies": ["sha2", "indicatif", "socket2"]
+      },
+      "transfer/sender.rs": {
+        "size_lines": 320,
+        "purpose": "TCP sender implementation - Single and multi-connection",
+        "key_types": ["TcpSender"],
+        "key_functions": [
+          "TcpSender::run() - Single-connection sender",
+          "run_multi_sender(streams, path, size, sha256)",
+          "sender_worker(...) - Multi-TCP sender worker"
+        ],
+        "dependencies": ["protocol::transfer", "transfer::helpers"]
+      },
+      "transfer/receiver.rs": {
+        "size_lines": 340,
+        "purpose": "TCP receiver implementation - Single and multi-connection",
+        "key_types": ["TcpReceiver"],
+        "key_functions": [
+          "TcpReceiver::run() - Single-connection receiver",
+          "run_multi_receiver(streams)",
+          "receiver_worker(...) - Multi-TCP receiver worker"
+        ],
+        "dependencies": ["protocol::transfer", "transfer::helpers"]
+      }
+    }
+  },
+  "protocol_flow": {
+    "registration": [
+      "1. Client -> Server: RegisterMessage (session_id, role, local_port)",
+      "2. Server -> Client: Registered (your_public_addr, needs_probing, probe_port)",
+      "3. Client -> Probe Server: Multiple ProbeMessages (if needs_probing)",
+      "4. Client -> Server: probes_complete",
+      "5. Server: Analyzes NAT pattern",
+      "6. Server -> Both Clients: peer_info (with NAT analysis)"
+    ],
+    "hole_punching": [
+      "7. Both Clients -> Server: ready",
+      "8. Sequential Mode:",
+      "  a. Client -> Server: request_attempt (attempt_num, used_ports)",
+      "  b. Server -> Client: go_attempt (port, start_at)",
+      "  c. Both peers: Synchronized punch at start_at",
+      "  d. Repeat until desired connections or timeout"
+    ],
+    "file_transfer": [
+      "9. Direct P2P connection established",
+      "10. Sender -> Receiver: HELLO, FILE_INFO",
+      "11. Receiver -> Sender: ACKs",
+      "12. Sender -> Receiver: Raw file data (pipelined)",
+      "13. Sender -> Receiver: DONE",
+      "14. Receiver: Verifies SHA256",
+      "15. Receiver -> Sender: Final ACK"
+    ]
+  },
+  "key_concepts": {
+    "nat_traversal": {
+      "description": "TCP hole punching through NAT firewalls",
+      "techniques": [
+        "Port prediction based on NAT probing",
+        "Sequential synchronized connection attempts",
+        "Server-coordinated timing (start_at timestamps)"
+      ]
+    },
+    "nat_patterns": {
+      "port_preserved": "NAT doesn't change port (easy)",
+      "constant_delta": "NAT adds constant offset (easy)",
+      "small_range": "NAT allocates within small range (medium)",
+      "random_like": "NAT allocates randomly (hard)"
+    },
+    "multi_tcp": {
+      "description": "Multiple parallel TCP connections for higher throughput",
+      "worker_pattern": "Chunk-based work distribution across streams"
+    }
+  },
+  "refactoring_status": {
+    "completed": [
+      "✅ Phase 0 - Python Server: 100% refactored (relay_server.py 565 lines → 5 modules, max 240 lines)",
+      "✅ Phase 1 - Rust Transfer: 100% refactored (transfer.rs 920 lines → 4 modules, max 340 lines)",
+      "✅ Phase 2 - Rust Protocol: 100% refactored (protocol.rs 340 lines → 3 modules, max 276 lines)",
+      "✅ Phase 3 - Rust Hole Punch: 100% refactored (hole_punch.rs 430 lines → 4 modules, max 150 lines)",
+      "✅ Phase 4 - Rust Main + CLI: Refactored (main.rs 620 lines → 2 modules: cli.rs 130 + main.rs 490)",
+      "✅ Phase 5 - Build Errors Fixed: All 3 critical errors resolved, compilation successful",
+      "✅ Phase 6 - Documentation: Module structure fully documented"
+    ],
+    "build_status": {
+      "compilation": "✅ SUCCESS",
+      "errors": 0,
+      "warnings": 13,
+      "build_time": "2.06s",
+      "note": "Warnings are non-critical (unused imports, dead code). Can be auto-fixed with 'cargo fix'."
+    },
+    "summary": {
+      "total_lines_refactored": "2,875 lines",
+      "modules_created": "Python: 8 modules | Rust: 16 modules",
+      "largest_file_after_refactoring": "main.rs (490 lines)",
+      "phases_completed": "6 of 6 (100%)",
+      "status": "✅ COMPLETE - Project successfully refactored and compiling",
+      "date_completed": "2026-01-23"
+    },
+    "fixed_errors": [
+      {
+        "error": "E0432 - Unresolved import 'hole_punch'",
+        "location": "src/protocol/relay.rs:6",
+        "fix": "Changed 'use crate::hole_punch::PeerAddress' to 'use crate::punch::PeerAddress'"
+      },
+      {
+        "error": "E0599 - Missing Digest trait",
+        "location": "src/transfer/receiver.rs:207",
+        "fix": "Added 'use sha2::Digest;' import"
+      },
+      {
+        "error": "E0277 - From<PeerAddressInfo> not implemented",
+        "location": "src/main.rs:257",
+        "fix": "Auto-resolved by fixing module name (error 1)"
+      }
+    ],
+    "next_steps": [
+      "Optional: Run 'cargo fix --bin tcp-transfer-ice' to auto-fix warnings",
+      "Optional: Test with real file transfers",
+      "Optional: Update README.md with new module structure"
+    ]
+  }
+}

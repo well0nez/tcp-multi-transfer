@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""
+TCP Hole Punch Relay Server v3.0 - ICE-Lite Edition
+Entry Point
+"""
+import asyncio
+import argparse
+import logging
+from .relay import TCPRelayServerICE
+
+# Default values
+DEFAULT_MAX_SCAN_PORTS = 512
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+async def main():
+    parser = argparse.ArgumentParser(description='TCP Relay Server v3.0 (ICE-Lite)')
+    parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
+    parser.add_argument('--port', type=int, default=9999, help='Main port')
+    parser.add_argument('--probe-port', type=int, default=9998, help='Probe port for NAT analysis')
+    parser.add_argument(
+        '--max-scan-ports',
+        type=int,
+        default=DEFAULT_MAX_SCAN_PORTS,
+        help=f'Max candidate ports to send to clients (default: {DEFAULT_MAX_SCAN_PORTS})',
+    )
+    args = parser.parse_args()
+
+    if args.max_scan_ports < 1:
+        parser.error('--max-scan-ports must be >= 1')
+    
+    server = TCPRelayServerICE(
+        args.host,
+        args.port,
+        args.probe_port,
+        max_scan_ports=args.max_scan_ports,
+    )
+    await server.start()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
