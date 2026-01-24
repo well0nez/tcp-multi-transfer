@@ -326,8 +326,6 @@ async def send_peer_info_for_connection(
     session_manager
 ):
     """Send peer_info for specific connection with punch strategy."""
-    from .utils import get_peer_addresses_with_prediction
-    
     sender_port = sender.bound_ports[conn_num] if conn_num < len(sender.bound_ports) else sender.local_port
     receiver_port = receiver.bound_ports[conn_num] if conn_num < len(receiver.bound_ports) else receiver.local_port
     

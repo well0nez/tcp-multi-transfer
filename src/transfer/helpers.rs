@@ -5,12 +5,13 @@
 
 use std::path::Path;
 use std::time::Duration;
+use std::fmt::Write as FmtWrite;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use anyhow::{Result, anyhow};
 use sha2::{Sha256, Digest};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle, ProgressState};
 use socket2::Socket;
 
 /// Progress update interval in bytes (10MB)
@@ -65,8 +66,12 @@ impl ProgressTracker {
 fn create_progress_bar(total_bytes: u64, filename: &str) -> ProgressBar {
     let pb = ProgressBar::new(total_bytes);
     pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}")
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({mbits_per_sec}) {msg}")
         .unwrap()
+        .with_key("mbits_per_sec", |state: &ProgressState, w: &mut dyn FmtWrite| {
+            let mbits_per_sec = state.per_sec() * 8.0 / 1_000_000.0;
+            let _ = write!(w, "{:.2} Mbit/s", mbits_per_sec);
+        })
         .progress_chars("=>-"));
     pb.set_message(filename.to_string());
     pb

@@ -253,40 +253,20 @@ pub async fn run_relay_protocol(
                 }
             }
             
-            RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, same_network, peer_nat_analysis, tcp_connections, allow_fallback, min_connections, peer_extra_ports, .. } => {
-                if let Some((ip, port)) = RelayMessage::parse_addr(&peer_public_addr) {
-                    let addr: SocketAddr = format!("{}:{}", ip, port).parse()?;
-                    session.peer_public_addr = Some(addr);
-                    session.peer_addresses = peer_addresses;
-                    session.same_network = same_network;
-                    session.peer_nat_analysis = peer_nat_analysis;
-                    
-                    session.tcp_connections = tcp_connections.unwrap_or(session.tcp_connections);
-                    session.allow_fallback = allow_fallback.unwrap_or(session.allow_fallback);
-                    session.min_connections = min_connections.unwrap_or(session.min_connections);
-                    session.peer_extra_ports = peer_extra_ports;
-                    
-                    info!("Peer info received! Peer: {} (local {})", addr, peer_local_port);
-                    
-                    let msg = r#"{"type":"ready"}"#.to_string() + "\n";
-                    writer.write_all(msg.as_bytes()).await?;
-                    writer.flush().await?;
-                    info!("READY sent, waiting for GO...");
-                }
+            RelayMessage::PeerInfo { .. } => {
+                warn!("Received peer_info during registration phase - ignoring");
             }
             
-            RelayMessage::PeerAddedPorts { ports } => {
-                info!("Received {} additional ports from peer: {:?}", ports.len(), ports);
-                session.peer_extra_ports.extend(ports);
+            RelayMessage::PeerAddedPorts { .. } => {
+                debug!("Received peer_added_ports during registration phase - ignoring");
             }
             
             RelayMessage::PortsAddedAck { .. } => {
-                // Wird in establish_multi_connections() verarbeitet
-                debug!("Received PortsAddedAck in registration phase - should be handled in multi-connection loop");
+                debug!("Received PortsAddedAck during registration phase - ignoring");
             }
             
             RelayMessage::Go { .. } => {
-                warn!("Received GO in registration phase - should be handled in multi-connection loop");
+                warn!("Received GO during registration phase - ignoring");
             }
             
             RelayMessage::Ping {} => {
@@ -301,7 +281,7 @@ pub async fn run_relay_protocol(
             
             // Retry Messages werden im Multi-Connection Loop verarbeitet
             RelayMessage::RetryRequest { .. } | RelayMessage::RetryGranted { .. } | RelayMessage::RetryRejected { .. } => {
-                debug!("Received retry message in registration phase - should be handled in multi-connection loop");
+                debug!("Received retry message during registration phase - ignoring");
             }
         }
     }

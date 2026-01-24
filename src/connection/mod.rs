@@ -134,7 +134,7 @@ pub async fn establish_multi_connections(
     let mut failures_in_a_row = 0;
     const MAX_FAILURES: u32 = 5;
     
-    let (actual_tcp_connections, start_conn, mut saved_first_peer_info) = if role == "receiver" {
+    let (actual_tcp_connections, mut saved_first_peer_info) = if role == "receiver" {
         info!("Receiver: Waiting for initial peer_info to determine connection count...");
         
         // Read the first peer_info and SAVE it for connection 0
@@ -147,7 +147,7 @@ pub async fn establish_multi_connections(
         info!("Received initial peer_info: peer wants {} connections", peer_tcp_connections);
         info!("Receiver will establish all {} connections through state machine", peer_tcp_connections);
         
-        (peer_tcp_connections, 0, Some((peer_info, strategy)))  // Save peer_info for connection 0
+        (peer_tcp_connections, Some((peer_info, strategy)))  // Save peer_info for connection 0
     } else {
         let current_socket_count = session.bound_sockets.len() as u32;
         
@@ -187,10 +187,10 @@ pub async fn establish_multi_connections(
             }
         }
         
-        (tcp_connections, 0, None)  // No saved peer_info for sender
+        (tcp_connections, None)  // No saved peer_info for sender
     };
     
-    for conn_num in start_conn..actual_tcp_connections {
+    for conn_num in 0..actual_tcp_connections {
         let socket_index = conn_num as usize;
         
         if socket_index >= session.bound_sockets.len() {

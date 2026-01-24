@@ -177,8 +177,8 @@ impl TcpReceiver {
         self.stream = Some(stream);
         
         let transfer_time = start.elapsed();
-        let transfer_speed = (file_info.file_size as f64 / 1048576.0) / transfer_time.as_secs_f64();
-        info!("Transfer complete: {:.1} MB/s [PIPELINED]", transfer_speed);
+        let transfer_speed_mbit = (file_info.file_size as f64 * 8.0) / 1_000_000.0 / transfer_time.as_secs_f64();
+        info!("Transfer complete: {:.1} Mbit/s [PIPELINED]", transfer_speed_mbit);
         
         progress_bar.set_position(file_size);
         progress_bar.set_message("Verifying SHA256...");
@@ -190,8 +190,8 @@ impl TcpReceiver {
             let ack = encode_simple(MessageType::Ack);
             let stream = self.stream.as_mut().unwrap();
             write_all_timeout(stream, &ack, HANDSHAKE_TIMEOUT).await?;
-            let speed_mbps = (file_info.file_size as f64 / 1048576.0) / start.elapsed().as_secs_f64();
-            progress_bar.finish_with_message(format!("Complete! ({:.1} MB/s)", speed_mbps));
+            let speed_mbit = (file_info.file_size as f64 * 8.0) / 1_000_000.0 / start.elapsed().as_secs_f64();
+            progress_bar.finish_with_message(format!("Complete! ({:.1} Mbit/s)", speed_mbit));
             info!("File saved: {}", file_info.filename);
             Ok(())
         } else {
@@ -226,8 +226,10 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
     if streams.is_empty() { return Err(anyhow!("No streams")); }
     info!("Using {} streams in connection order", streams.len());
     
-    for stream in streams.iter() {
-        configure_tcp_socket(stream)?;
+    for (i, stream) in streams.iter().enumerate() {
+        if i != 0 {
+            configure_tcp_socket(stream)?;
+        }
     }
     
     // Handshake + FileInfo only on first stream (heavy protocol setup)

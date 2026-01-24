@@ -169,9 +169,9 @@ impl TcpSender {
         if buf[0] != MessageType::Ack as u8 { return Err(anyhow!("Expected final ACK, got type {}", buf[0])); }
         
         let elapsed = start.elapsed();
-        let speed_mbps = (self.file_size as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
-        progress.finish_with_message(format!("Transfer complete! ({:.1} MB/s)", speed_mbps));
-        info!("Transfer complete: {:.2} MB in {:.1}s ({:.1} MB/s)", self.file_size as f64 / 1048576.0, elapsed.as_secs_f64(), speed_mbps);
+        let speed_mbit = (self.file_size as f64 * 8.0) / 1_000_000.0 / elapsed.as_secs_f64();
+        progress.finish_with_message(format!("Transfer complete! ({:.1} Mbit/s)", speed_mbit));
+        info!("Transfer complete: {:.2} MB in {:.1}s ({:.1} Mbit/s)", self.file_size as f64 / 1048576.0, elapsed.as_secs_f64(), speed_mbit);
         Ok(())
     }
 }
@@ -185,8 +185,10 @@ pub async fn run_multi_sender(
     if streams.is_empty() { return Err(anyhow!("No streams")); }
     info!("Using {} streams in connection order", streams.len());
     
-    for stream in streams.iter() {
-        configure_tcp_socket(stream)?;
+    for (i, stream) in streams.iter().enumerate() {
+        if i != 0 {
+            configure_tcp_socket(stream)?;
+        }
     }
     
     let total_streams = streams.len();

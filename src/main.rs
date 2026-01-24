@@ -34,7 +34,8 @@ struct LocalTime;
 impl FormatTime for LocalTime {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         let now = chrono::Local::now();
-        write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S%.2f"))
+        let centis = now.timestamp_subsec_millis() / 10;
+        write!(w, "{}.{:02}", now.format("%Y-%m-%d %H:%M:%S"), centis)
     }
 }
 
