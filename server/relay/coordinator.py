@@ -17,15 +17,7 @@ async def coordinate_multi_connections(
     tcp_connections: int,
     max_scan_ports: int
 ):
-    """
-    Koordiniert mehrere Hole-Punch-Zyklen für Multi-Connection Support.
-    
-    Für jede Connection:
-    1. Sende peer_info mit connection_num und Port/Range
-    2. Warte auf BEIDE READYs
-    3. Sende synchronized GO
-    4. Warte 2+ Sekunden vor nächster Connection
-    """
+    """Coordinates multiple hole-punch cycles for multi-connection support."""
     lock = session_manager.get_session_lock(session_id)
     
     async with lock:
@@ -61,9 +53,8 @@ async def coordinate_multi_connections(
                            f"sender={len(sender.bound_ports)} ports, receiver={len(receiver.bound_ports)} ports")
                 return
             
-            await asyncio.sleep(0.05)  # Kurzes Polling (50ms)
+            await asyncio.sleep(0.05)
         
-        # 1. Sende peer_info für diese Connection
         await send_peer_info_for_connection(
             session_id,
             sender,
@@ -73,8 +64,7 @@ async def coordinate_multi_connections(
             session_manager
         )
         
-        # 2. Warte auf BEIDE READYs
-        max_wait = 60.0  # Festes 60s Timeout (keine zeitbasierte Heuristik mehr!)
+        max_wait = 60.0
         start_wait = time.time()
         
         while True:
@@ -92,8 +82,7 @@ async def coordinate_multi_connections(
             
             await asyncio.sleep(0.1)
         
-        # 3. Sende synchronized GO
-        start_at = time.time() + 1.5  # 1.5s Vorlauf
+        start_at = time.time() + 1.5
         go_msg = {
             'type': 'go',
             'start_at': start_at,
@@ -106,7 +95,6 @@ async def coordinate_multi_connections(
         
         logger.info(f"Session {session_id}: GO sent for connection {conn_num+1} at {start_at:.3f}")
         
-        # 4. Reset ready flags
         async with lock:
             sender.ready_for_connection[conn_num] = False
             receiver.ready_for_connection[conn_num] = False
@@ -123,7 +111,7 @@ async def send_peer_info_for_connection(
     max_scan_ports: int,
     session_manager
 ):
-    """Sende peer_info für eine spezifische Connection mit Punch-Strategie"""
+    """Send peer_info for specific connection with punch strategy."""
     from .utils import get_peer_addresses_with_prediction
     
     sender_port = sender.bound_ports[conn_num] if conn_num < len(sender.bound_ports) else sender.local_port
@@ -136,7 +124,6 @@ async def send_peer_info_for_connection(
                 f"Sender local={sender_port} nat={sender_nat_port}, "
                 f"Receiver local={receiver_port} nat={receiver_nat_port}")
     
-    # Bestimme Punch-Strategie basierend auf NAT-Typen
     sender_strategy = determine_punch_strategy(sender, receiver)
     receiver_strategy = determine_punch_strategy(receiver, sender)
     
@@ -163,7 +150,7 @@ async def send_peer_info_for_connection(
         'same_network': False,
         'peer_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None,
         'punch_strategy': sender_strategy,
-        'tcp_connections': sender.tcp_connections,  # Sender weiß schon, wie viele er will
+        'tcp_connections': sender.tcp_connections,
     }
     await send_message(sender.writer, msg_to_sender)
     
@@ -186,24 +173,17 @@ async def send_peer_info_for_connection(
 
 
 def get_nat_port_for_local_port(peer, local_port: int) -> int:
-    """
-    Finde NAT-Port für einen gegebenen lokalen Port aus probe_ports.
-    Fallback: Intelligente Vorhersage basierend auf NAT-Typ.
-    """
-    # 1. Versuche exakte Übereinstimmung in probe_ports
+    """Find NAT port for local port with intelligent prediction fallback."""
     for lport, nport in peer.probe_ports:
         if lport == local_port:
             logger.debug(f"Found NAT port {nport} for local port {local_port}")
             return nport
     
-    # 2. Port-Preserved NAT: NAT-Port = Local-Port (kein Probing nötig!)
     if peer.nat_analysis and peer.nat_analysis.pattern_type == "port_preserved":
         logger.debug(f"Port-Preserved NAT: predicting NAT port {local_port} for local port {local_port}")
         return local_port
     
-    # 3. Versuche Delta-Berechnung (falls wir mindestens ein Mapping haben)
     if peer.probe_ports:
-        # Berechne Delta aus erstem bekannten Mapping
         first_local, first_nat = peer.probe_ports[0]
         delta = first_nat - first_local
         predicted_nat = local_port + delta
@@ -211,34 +191,18 @@ def get_nat_port_for_local_port(peer, local_port: int) -> int:
         logger.info(f"Predicted NAT port {predicted_nat} for local port {local_port} (delta={delta})")
         return predicted_nat
     
-    # 4. Letzter Fallback: Verwende public_addr Port (nur für erste Connection)
     logger.warning(f"No probe_port found for local {local_port}, using public_addr port {peer.public_addr[1]} (first connection fallback)")
     return peer.public_addr[1]
 
 
 def determine_punch_strategy(my_peer, other_peer) -> str:
     """
-    Bestimme Punch-Strategie für TCP Hole Punching.
+    Determine punch strategy for TCP hole punching.
     
-    Strategie:
-    - "scan": Simultaneous Open (Listener + Connect parallel)
+    Always returns "scan" (Simultaneous Open: Listener + Connect parallel).
+    All NAT types require Simultaneous Open to create holes in both NATs.
     
-    ALLE NAT-Typen benötigen Simultaneous Open!
-    Beide Peers müssen gleichzeitig:
-    1. Einen Listener starten
-    2. Zum Peer connecten
-    
-    Das öffnet "Löcher" in beiden NATs und ermöglicht die Verbindung.
-    
-    Unterschied zwischen NAT-Typen:
-    - Port-Preserved NAT: peer_addresses enthält nur 1 Adresse (vorhersagbar)
-      → Schneller, da nur 1 Connect-Versuch nötig
-    - Complex NAT (CGNAT): peer_addresses enthält 100-500 Adressen (Port-Range)
-      → Dauert länger, da viele Connect-Versuche parallel
-    
-    Beide verwenden die GLEICHE Strategie (SCAN = Simultaneous Open),
-    nur die Anzahl der Adressen unterscheidet sich!
+    Port-Preserved NAT: peer_addresses contains 1 address (predictable).
+    Complex NAT (CGNAT): peer_addresses contains 100-500 addresses (port range).
     """
-    # IMMER Simultaneous Open verwenden!
-    # Das ist der einzige korrekte Weg für NAT Traversal.
     return "scan"
