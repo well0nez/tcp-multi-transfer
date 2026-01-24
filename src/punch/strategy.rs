@@ -385,6 +385,7 @@ async fn wait_for_connect(stream: std::net::TcpStream, timeout: Duration) -> Res
 }
 
 /// Peer-Info für Strategy-basiertes Punching
+#[derive(Debug, Clone)]
 pub struct PeerInfo {
     pub peer_addr: SocketAddr,
     pub peer_addresses: Vec<PeerAddressInfo>,

@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 *.log
 MULTI_TCP_PLAN.md
+src/connection_tests.rs
 
 # Backup directories
 copy/
