@@ -213,6 +213,13 @@ pub enum RelayMessage {
         connection_num: u32,
     },
     
+    /// Retry Rejected: Server lehnt Retry ab (Peer fehlt oder Timeout)
+    #[serde(rename = "retry_rejected")]
+    RetryRejected {
+        connection_num: u32,
+        reason: String,
+    },
+    
     #[serde(rename = "ping")]
     Ping {},
     

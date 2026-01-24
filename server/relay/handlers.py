@@ -252,6 +252,12 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager):
         if sender.retry_requested.get(conn_num) and receiver.retry_requested.get(conn_num):
             logger.info(f"Session {session_id}: Both peers want retry for connection {conn_num} - granting!")
             
+            # Cancel timeout task if it exists
+            timeout_key = f'retry_timeout_task_{conn_num}'
+            if timeout_key in session:
+                session[timeout_key].cancel()
+                del session[timeout_key]
+            
             await send_message(sender.writer, {
                 'type': 'retry_granted',
                 'connection_num': conn_num
@@ -277,4 +283,61 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager):
             
             logger.info(f"Session {session_id}: Retry granted for connection {conn_num}, waiting for add_ports from BOTH peers")
         else:
-            logger.info(f"Session {session_id}: Waiting for other peer to request retry for connection {conn_num}")
+            # Start timeout task if not already started
+            timeout_key = f'retry_timeout_task_{conn_num}'
+            if timeout_key not in session:
+                logger.info(f"Session {session_id}: Starting retry coordination timeout (45s) for connection {conn_num}")
+                session[timeout_key] = asyncio.create_task(
+                    retry_coordination_timeout(session_id, conn_num, 45.0, session_manager)
+                )
+            else:
+                logger.info(f"Session {session_id}: Waiting for other peer to request retry for connection {conn_num}")
+
+
+async def retry_coordination_timeout(session_id: str, conn_num: int, timeout_sec: float, session_manager):
+    """Handle retry coordination timeout - send retry_rejected if peer missing."""
+    await asyncio.sleep(timeout_sec)
+    
+    lock = session_manager.get_session_lock(session_id)
+    async with lock:
+        session = session_manager.sessions.get(session_id)
+        if not session:
+            logger.debug(f"Session {session_id} no longer exists (timeout cleanup)")
+            return
+        
+        sender = session.get('sender')
+        receiver = session.get('receiver')
+        
+        if not sender or not receiver:
+            return
+        
+        sender_waiting = getattr(sender, 'retry_requested', {}).get(conn_num, False)
+        receiver_waiting = getattr(receiver, 'retry_requested', {}).get(conn_num, False)
+        
+        # If both are now waiting, they already got granted (race condition)
+        if sender_waiting and receiver_waiting:
+            logger.debug(f"Session {session_id}: Both peers waiting at timeout - already handled")
+            return
+        
+        # If only one is waiting, send retry_rejected
+        if sender_waiting and not receiver_waiting:
+            logger.warning(f"Session {session_id}: Retry coordination timeout - receiver missing for conn {conn_num}")
+            await send_message(sender.writer, {
+                'type': 'retry_rejected',
+                'connection_num': conn_num,
+                'reason': 'peer_missing'
+            })
+            sender.retry_requested[conn_num] = False
+        elif receiver_waiting and not sender_waiting:
+            logger.warning(f"Session {session_id}: Retry coordination timeout - sender missing for conn {conn_num}")
+            await send_message(receiver.writer, {
+                'type': 'retry_rejected',
+                'connection_num': conn_num,
+                'reason': 'peer_missing'
+            })
+            receiver.retry_requested[conn_num] = False
+        
+        # Clean up timeout task
+        timeout_key = f'retry_timeout_task_{conn_num}'
+        if timeout_key in session:
+            del session[timeout_key]

@@ -308,7 +308,7 @@ pub async fn establish_multi_connections(
                 ConnectionState::WaitingForRetry { conn_num, attempt } => {
                     debug!("State: WaitingForRetry (conn {}, attempt {})", conn_num, attempt);
                     
-                    match wait_for_retry_granted_from_queue(&queues, conn_num, Duration::from_secs(30)).await {
+                    match wait_for_retry_granted_from_queue(&queues, conn_num, Duration::from_secs(60)).await {
                         Ok(()) => {
                             info!("Retry granted by server for connection {}", conn_num + 1);
                             
@@ -368,7 +368,13 @@ pub async fn establish_multi_connections(
                             if failures_in_a_row >= MAX_FAILURES {
                                 return Err(anyhow!("Max failures reached waiting for retry_granted"));
                             }
-                            state
+                            // FIX: Don't return same state - transition to Failed
+                            error!("Retry coordination failed for connection {}: {}", conn_num + 1, e);
+                            ConnectionState::Failed {
+                                conn_num,
+                                reason: format!("Retry coordination failed: {}", e),
+                                attempt: attempt + 1,
+                            }
                         }
                     }
                 }

@@ -300,7 +300,7 @@ pub async fn run_relay_protocol(
             RelayMessage::Error { message } => return Err(anyhow!("Server error: {}", message)),
             
             // Retry Messages werden im Multi-Connection Loop verarbeitet
-            RelayMessage::RetryRequest { .. } | RelayMessage::RetryGranted { .. } => {
+            RelayMessage::RetryRequest { .. } | RelayMessage::RetryGranted { .. } | RelayMessage::RetryRejected { .. } => {
                 debug!("Received retry message in registration phase - should be handled in multi-connection loop");
             }
         }

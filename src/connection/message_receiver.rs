@@ -97,6 +97,11 @@ pub fn spawn_message_receiver(
                                     debug!("Queued RetryGranted for conn {}", connection_num);
                                 }
                                 
+                                RelayMessage::RetryRejected { connection_num, reason } => {
+                                    queues.push_retry_rejected(connection_num, reason.clone());
+                                    debug!("Queued RetryRejected for conn {}: {}", connection_num, reason);
+                                }
+                                
                                 RelayMessage::Error { message } => {
                                     queues.push_error(message.clone());
                                     error!("Server error: {}", message);

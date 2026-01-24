@@ -14,6 +14,7 @@ pub struct MessageQueues {
     ports_acks: Arc<Mutex<VecDeque<Vec<u16>>>>,
     peer_added_ports: Arc<Mutex<VecDeque<Vec<u16>>>>,
     retry_granted: Arc<Mutex<VecDeque<u32>>>,
+    retry_rejected: Arc<Mutex<VecDeque<(u32, String)>>>,
     errors: Arc<Mutex<VecDeque<String>>>,
     shutdown: Arc<Mutex<bool>>,
 }
@@ -26,6 +27,7 @@ impl MessageQueues {
             ports_acks: Arc::new(Mutex::new(VecDeque::new())),
             peer_added_ports: Arc::new(Mutex::new(VecDeque::new())),
             retry_granted: Arc::new(Mutex::new(VecDeque::new())),
+            retry_rejected: Arc::new(Mutex::new(VecDeque::new())),
             errors: Arc::new(Mutex::new(VecDeque::new())),
             shutdown: Arc::new(Mutex::new(false)),
         }
@@ -110,6 +112,23 @@ impl MessageQueues {
         } else {
             None
         }
+    }
+    
+    pub fn push_retry_rejected(&self, conn_num: u32, reason: String) {
+        if let Ok(mut queue) = self.retry_rejected.lock() {
+            queue.push_back((conn_num, reason));
+        }
+    }
+    
+    pub fn pop_retry_rejected(&self, conn_num: u32) -> Option<String> {
+        if let Ok(mut queue) = self.retry_rejected.lock() {
+            if let Some(pos) = queue.iter().position(|(num, _)| *num == conn_num) {
+                if let Some((_, reason)) = queue.remove(pos) {
+                    return Some(reason);
+                }
+            }
+        }
+        None
     }
     
     pub fn push_error(&self, error: String) {

@@ -107,6 +107,12 @@ pub async fn wait_for_retry_granted_from_queue(
             return Err(anyhow!("Server error: {}", error));
         }
         
+        // Check for retry_rejected first (higher priority than granted)
+        if let Some(reason) = queues.pop_retry_rejected(conn_num) {
+            debug!("Got RetryRejected for conn {} from queue: {}", conn_num, reason);
+            return Err(anyhow!("Retry rejected: {}", reason));
+        }
+        
         if let Some(granted_conn) = queues.pop_retry_granted(conn_num) {
             if granted_conn == conn_num {
                 debug!("Got RetryGranted for conn {} from queue", conn_num);
