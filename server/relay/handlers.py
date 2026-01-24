@@ -112,33 +112,33 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
                 })
                 logger.info(f"Notified {other_peer.role} about {len(ports)} new ports from {peer.role}")
             
-            if hasattr(session, 'retry_add_ports_pending') and session.get('retry_add_ports_pending'):
-                for conn_num, pending in session['retry_add_ports_pending'].items():
-                    if not pending[peer.role]:
+            if 'retry_add_ports_pending' in session and session.get('retry_add_ports_pending'):
+                for conn_num, pending in list(session['retry_add_ports_pending'].items()):
+                    if not pending.get(peer.role):
                         pending[peer.role] = True
                         logger.info(f"Session {session_id}: Peer {peer.role} sent add_ports for retry connection {conn_num}")
                         
                         sender = session.get('sender')
                         receiver = session.get('receiver')
                         
-                        if sender and receiver and pending['sender'] and pending['receiver']:
-                            logger.info(f"Session {session_id}: BOTH peers sent add_ports for retry connection {conn_num} - sending updated peer_info!")
+                        if sender and receiver and pending.get('sender') and pending.get('receiver'):
+                            logger.info(f"Session {session_id}: BOTH peers sent add_ports for retry connection {conn_num} - coordinating retry")
                             
-                            from .coordinator import send_peer_info_for_connection
+                            from .coordinator import coordinate_retry_connection
                             
-                            max_scan_ports = pending['max_scan_ports']
+                            max_scan_ports = pending.get('max_scan_ports', 100)
                             
-                            await send_peer_info_for_connection(
-                                session_id,
-                                sender,
-                                receiver,
-                                conn_num,
-                                max_scan_ports,
-                                session_manager
+                            asyncio.create_task(
+                                coordinate_retry_connection(
+                                    session_id,
+                                    session_manager,
+                                    conn_num,
+                                    max_scan_ports,
+                                )
                             )
                             
                             del session['retry_add_ports_pending'][conn_num]
-                            logger.info(f"Session {session_id}: Updated peer_info sent for retry connection {conn_num}, waiting for new READYs")
+                            logger.info(f"Session {session_id}: Retry coordination task started for connection {conn_num}")
                         
                         break
 
@@ -273,7 +273,7 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager):
             sender.ready_for_connection[conn_num] = False
             receiver.ready_for_connection[conn_num] = False
             
-            if not hasattr(session, 'retry_add_ports_pending'):
+            if 'retry_add_ports_pending' not in session:
                 session['retry_add_ports_pending'] = {}
             session['retry_add_ports_pending'][conn_num] = {
                 'sender': False,

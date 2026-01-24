@@ -103,6 +103,74 @@ async def coordinate_multi_connections(
             await asyncio.sleep(0.1)
 
 
+async def coordinate_retry_connection(
+    session_id: str,
+    session_manager,
+    conn_num: int,
+    max_scan_ports: int,
+    ready_timeout: float = 60.0,
+    go_delay: float = 1.5,
+):
+    """Coordinate a retry for a single connection after both peers added new ports."""
+    lock = session_manager.get_session_lock(session_id)
+    
+    async with lock:
+        session = session_manager.sessions.get(session_id)
+        if not session:
+            logger.error(f"Session {session_id} not found for retry connection {conn_num}")
+            return
+        
+        sender = session.get('sender')
+        receiver = session.get('receiver')
+        
+        if not sender or not receiver:
+            logger.error(f"Session {session_id}: Missing sender or receiver for retry connection {conn_num}")
+            return
+    
+    await send_peer_info_for_connection(
+        session_id,
+        sender,
+        receiver,
+        conn_num,
+        max_scan_ports,
+        session_manager
+    )
+    
+    start_wait = time.time()
+    
+    while True:
+        async with lock:
+            sender_ready = sender.ready_for_connection.get(conn_num, False)
+            receiver_ready = receiver.ready_for_connection.get(conn_num, False)
+            
+            if sender_ready and receiver_ready:
+                logger.info(f"Session {session_id}: Both peers ready for retry connection {conn_num}")
+                break
+            
+            if time.time() - start_wait > ready_timeout:
+                logger.error(f"Session {session_id}: Timeout waiting for READYs (retry conn {conn_num})")
+                return
+        
+        await asyncio.sleep(0.1)
+    
+    start_at = time.time() + go_delay
+    go_msg = {
+        'type': 'go',
+        'start_at': start_at,
+        'connection_num': conn_num,
+        'message': f'Retry connection {conn_num+1}'
+    }
+    
+    await send_message(sender.writer, go_msg)
+    await send_message(receiver.writer, go_msg)
+    
+    logger.info(f"Session {session_id}: GO sent for retry connection {conn_num+1} at {start_at:.3f}")
+    
+    async with lock:
+        sender.ready_for_connection[conn_num] = False
+        receiver.ready_for_connection[conn_num] = False
+
+
 async def send_peer_info_for_connection(
     session_id: str,
     sender,
