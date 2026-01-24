@@ -2,7 +2,7 @@
 Data models for TCP Relay Server
 """
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import asyncio
 
 
@@ -80,4 +80,6 @@ class Peer:
     bound_ports: List[int] = field(default_factory=list)  # All bound ports from client
     
     # Multi-Connection coordination state
-    ready_for_connection: dict = field(default_factory=dict)  # conn_num → ready (bool)
+    ready_for_connection: dict = field(default_factory=dict)
+    conn_results: Dict[int, str] = field(default_factory=dict)  # conn_num -> "established" | "abandoned"
+    conn_reasons: Dict[int, str] = field(default_factory=dict)  # conn_num -> reason (optional)  # conn_num → ready (bool)

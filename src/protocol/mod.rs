@@ -9,6 +9,6 @@ pub mod transfer;
 
 // Re-export commonly used types
 pub use relay::{
-    RegisterMessage, AddPortsMessage,
+    RegisterMessage, AddPortsMessage, ConnEstablishedMessage, ConnAbandonedMessage,
     ProbeMessage, RelayMessage, NATAnalysis
 };

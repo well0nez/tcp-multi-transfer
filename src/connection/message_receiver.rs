@@ -28,11 +28,19 @@ pub fn spawn_message_receiver(
             
             match tokio::time::timeout(Duration::from_secs(5), relay_reader.read_line(&mut line)).await {
                 Ok(Ok(0)) => {
+                    if queues.is_shutdown() {
+                        info!("Relay connection closed after shutdown");
+                        break;
+                    }
                     error!("Connection closed by relay server");
                     queues.push_error("Connection lost".to_string());
                     break;
                 }
                 Ok(Err(e)) => {
+                    if queues.is_shutdown() {
+                        info!("Relay connection read error after shutdown: {}", e);
+                        break;
+                    }
                     error!("Read error from relay server: {}", e);
                     queues.push_error(format!("Read error: {}", e));
                     break;

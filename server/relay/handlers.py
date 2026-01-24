@@ -49,6 +49,12 @@ async def wait_for_peer_messages(peer: Peer, session_manager, max_scan_ports: in
                 logger.info(f"Peer {peer.role} sent retry_request")
                 await handle_retry_request(msg, peer, session_manager, max_scan_ports)
             
+            elif msg_type == 'conn_established':
+                await handle_conn_result(msg, peer, session_manager, "established")
+            
+            elif msg_type == 'conn_abandoned':
+                await handle_conn_result(msg, peer, session_manager, "abandoned")
+            
         except asyncio.TimeoutError:
             try:
                 await send_message(peer.writer, {'type': 'ping'})
@@ -360,3 +366,25 @@ async def retry_coordination_timeout(session_id: str, conn_num: int, timeout_sec
         timeout_key = f'retry_timeout_task_{conn_num}'
         if timeout_key in session:
             del session[timeout_key]
+
+
+async def handle_conn_result(msg: dict, peer: Peer, session_manager, status: str):
+    """Handle connection result from client (established or abandoned)."""
+    conn_num = msg.get('connection_num')
+    if conn_num is None:
+        logger.warning(f"Received conn_result with no connection_num from {peer.role}")
+        return
+    
+    reason = msg.get('reason')
+    session_id = peer.session_id
+    
+    lock = session_manager.get_session_lock(session_id)
+    async with lock:
+        peer.conn_results[conn_num] = status
+        if reason:
+            peer.conn_reasons[conn_num] = str(reason)
+    
+    if reason:
+        logger.info(f"Peer {peer.role} reported {status} for connection {conn_num} (reason={reason})")
+    else:
+        logger.info(f"Peer {peer.role} reported {status} for connection {conn_num}")

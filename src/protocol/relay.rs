@@ -88,6 +88,41 @@ impl AddPortsMessage {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ConnEstablishedMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub connection_num: u32,
+}
+
+impl ConnEstablishedMessage {
+    pub fn new(connection_num: u32) -> Self {
+        Self {
+            msg_type: "conn_established".to_string(),
+            connection_num,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnAbandonedMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub connection_num: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ConnAbandonedMessage {
+    pub fn new(connection_num: u32, reason: Option<String>) -> Self {
+        Self {
+            msg_type: "conn_abandoned".to_string(),
+            connection_num,
+            reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProbeMessage {
     #[serde(rename = "type")]
     pub msg_type: String,
