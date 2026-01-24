@@ -247,19 +247,37 @@ def get_nat_port_for_local_port(peer, local_port: int) -> int:
             logger.debug(f"Found NAT port {nport} for local port {local_port}")
             return nport
     
-    if peer.nat_analysis and peer.nat_analysis.pattern_type == "port_preserved":
-        logger.debug(f"Port-Preserved NAT: predicting NAT port {local_port} for local port {local_port}")
-        return local_port
-    
-    if peer.probe_ports:
-        first_local, first_nat = peer.probe_ports[0]
-        delta = first_nat - first_local
-        predicted_nat = local_port + delta
+    analysis = peer.nat_analysis
+    if analysis:
+        if analysis.pattern_type == "port_preserved":
+            logger.debug(f"Port-Preserved NAT: predicting NAT port {local_port} for local port {local_port}")
+            return local_port
         
-        logger.info(f"Predicted NAT port {predicted_nat} for local port {local_port} (delta={delta})")
-        return predicted_nat
+        # External mode: NAT port is independent of local port.
+        if getattr(peer, "prediction_mode", "delta") == "external" and analysis.predicted_port:
+            predicted = max(1024, min(65535, int(round(analysis.predicted_port))))
+            logger.info(f"External NAT mode: using predicted NAT port {predicted} for local port {local_port}")
+            return predicted
+        
+        # Delta-based prediction: NAT port follows local port with a stable offset.
+        if analysis.delta_min != 0 or analysis.delta_max != 0 or analysis.delta_median != 0:
+            predicted_nat = local_port + analysis.delta_median + (analysis.predicted_shift or 0)
+            predicted = max(1024, min(65535, int(round(predicted_nat))))
+            logger.info(
+                f"Predicted NAT port {predicted} for local port {local_port} "
+                f"(delta_median={analysis.delta_median}, shift={analysis.predicted_shift})"
+            )
+            return predicted
+        
+        if analysis.predicted_port:
+            predicted = max(1024, min(65535, int(round(analysis.predicted_port))))
+            logger.info(f"Fallback to predicted NAT port {predicted} for local port {local_port}")
+            return predicted
     
-    logger.warning(f"No probe_port found for local {local_port}, using public_addr port {peer.public_addr[1]} (first connection fallback)")
+    logger.warning(
+        f"No NAT prediction available for local {local_port}, using public_addr port {peer.public_addr[1]} "
+        f"(control-connection fallback)"
+    )
     return peer.public_addr[1]
 
 
