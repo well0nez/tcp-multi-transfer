@@ -20,6 +20,9 @@ use super::helpers::*;
 /// Buffer size for file I/O (16MB)
 const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
+/// Progress update chunk size for socket reads (256KB)
+const PROGRESS_IO_CHUNK: usize = 256 * 1024;
+
 /// Pipeline depth for async I/O (16 chunks = ~128MB in flight at 8MB chunks)
 const PIPELINE_DEPTH: usize = 16;
 
@@ -106,6 +109,22 @@ async fn receive_file_info_on_stream(stream: &mut TcpStream) -> Result<FileInfoM
     Ok(info)
 }
 
+async fn read_exact_with_progress(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    timeout: Duration,
+    counter: &Arc<AtomicU64>,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        let end = std::cmp::min(offset + PROGRESS_IO_CHUNK, buf.len());
+        read_exact_timeout(stream, &mut buf[offset..end], timeout).await?;
+        counter.fetch_add((end - offset) as u64, Ordering::Relaxed);
+        offset = end;
+    }
+    Ok(())
+}
+
 pub struct TcpReceiver {
     stream: Option<TcpStream>,
 }
@@ -120,8 +139,8 @@ impl TcpReceiver {
         let file_info = receive_file_info_on_stream(&mut stream).await?;
         
         let temp_path = format!("{}.tmp", file_info.filename);
-        let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress_clone = progress.clone();
+        let progress_bar = ProgressTracker::new(file_info.file_size, &file_info.filename);
+        let progress_bytes = progress_bar.bytes();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(PIPELINE_DEPTH);
         let file_size = file_info.file_size;
         let chunk_size = super::get_chunk_size();
@@ -142,7 +161,7 @@ impl TcpReceiver {
                 };
                 if tx.send(bytes::Bytes::copy_from_slice(&buffer[..n])).await.is_err() { break; }
                 total_received += n as u64;
-                progress_clone.store(total_received, std::sync::atomic::Ordering::Relaxed);
+                progress_bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
             let mut done_buf = [0u8; 1];
             match read_exact_timeout(&mut stream, &mut done_buf, HANDSHAKE_TIMEOUT).await {
@@ -162,15 +181,6 @@ impl TcpReceiver {
             writer.flush().await?;
             Ok::<_, anyhow::Error>(())
         });
-        
-        let mut progress_bar = ProgressTracker::new(file_info.file_size, &file_info.filename);
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let current = progress.load(std::sync::atomic::Ordering::Relaxed);
-            progress_bar.update(current);
-            if current >= file_size { break; }
-            if reader_handle.is_finished() || writer_handle.is_finished() { break; }
-        }
         
         let stream = reader_handle.await.map_err(|e| anyhow!("Reader panicked: {}", e))??;
         writer_handle.await.map_err(|e| anyhow!("Writer panicked: {}", e))??;
@@ -256,7 +266,7 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
     
     let received_flags = Arc::new((0..total_chunks).map(|_| AtomicBool::new(false)).collect::<Vec<_>>());
     let received_count = Arc::new(AtomicUsize::new(0));
-    let received_bytes = Arc::new(AtomicU64::new(0));
+    let io_bytes = Arc::new(AtomicU64::new(0));
     let done_received = Arc::new(AtomicBool::new(false));
     let done_notify = Arc::new(Notify::new());
     
@@ -265,21 +275,19 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
         let temp = temp_path.clone();
         let flags = received_flags.clone();
         let count = received_count.clone();
-        let bytes = received_bytes.clone();
+        let io_bytes = io_bytes.clone();
         let done = done_received.clone();
         let notify = done_notify.clone();
         handles.push(tokio::spawn(async move {
-            receiver_worker(i as u8, stream, temp, file_info.file_size, flags, count, bytes, done, notify).await
+            receiver_worker(i as u8, stream, temp, file_info.file_size, flags, count, io_bytes, done, notify).await
         }));
     }
     
-    let mut progress_bar = ProgressTracker::new(file_info.file_size, &file_info.filename);
+    let progress_bar = ProgressTracker::with_bytes(file_info.file_size, &file_info.filename, io_bytes.clone());
     loop {
-        let current = received_bytes.load(Ordering::Relaxed);
-        progress_bar.update(current);
         if done_received.load(Ordering::Relaxed) { break; }
         if handles.iter().all(|h| h.is_finished()) { break; }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     
     for handle in handles { let _ = handle.await; }
@@ -288,6 +296,7 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
         return Err(anyhow!("Transfer incomplete"));
     }
     
+    progress_bar.set_position(file_info.file_size);
     progress_bar.set_message("Verifying SHA256...");
     let calculated_hash = sha256_file(Path::new(&temp_path)).await?;
     if calculated_hash == file_info.sha256 {
@@ -306,7 +315,7 @@ async fn receiver_worker(
     _file_size: u64,
     received_flags: Arc<Vec<AtomicBool>>,
     received_count: Arc<AtomicUsize>,
-    received_bytes: Arc<AtomicU64>,
+    io_bytes: Arc<AtomicU64>,
     done_received: Arc<AtomicBool>,
     done_notify: Arc<Notify>,
 ) -> Result<TcpStream> {
@@ -341,7 +350,7 @@ async fn receiver_worker(
                 if data.len() < data_len {
                     data.resize(data_len, 0u8);
                 }
-                read_exact_timeout(&mut stream, &mut data[..data_len], IO_TIMEOUT).await?;
+                read_exact_with_progress(&mut stream, &mut data[..data_len], IO_TIMEOUT, &io_bytes).await?;
                 
                 let mut hasher = Hasher::new();
                 hasher.update(&data[..data_len]);
@@ -356,7 +365,6 @@ async fn receiver_worker(
                 
                 if !received_flags[header.chunk_id as usize].swap(true, Ordering::AcqRel) {
                     received_count.fetch_add(1, Ordering::Relaxed);
-                    received_bytes.fetch_add(header.len as u64, Ordering::Relaxed);
                 }
                 
                 let ack = ChunkAckMessage { chunk_id: header.chunk_id, is_nack: false };

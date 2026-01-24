@@ -5,6 +5,9 @@
 
 use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::fmt::Write as FmtWrite;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,47 +17,65 @@ use sha2::{Sha256, Digest};
 use indicatif::{ProgressBar, ProgressStyle, ProgressState};
 use socket2::Socket;
 
-/// Progress update interval in bytes (10MB)
-const PROGRESS_BYTE_INTERVAL: u64 = 10 * 1024 * 1024;
+/// Progress update interval
+const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
-/// Progress update interval in time (2 seconds)
-const PROGRESS_TIME_INTERVAL: Duration = Duration::from_secs(2);
+/// Speed smoothing factor (EMA)
+const SPEED_EMA_ALPHA: f64 = 0.1;
 
 /// TCP socket buffer size (64MB each for send/recv)
 const TCP_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
-/// Progress tracker with hybrid update strategy
+/// Progress tracker with atomic byte counter and periodic UI updates
 pub struct ProgressTracker {
     bar: ProgressBar,
-    last_update_bytes: u64,
-    last_update_time: std::time::Instant,
+    position_bytes: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl ProgressTracker {
     pub fn new(total_bytes: u64, filename: &str) -> Self {
-        Self {
-            bar: create_progress_bar(total_bytes, filename),
-            last_update_bytes: 0,
-            last_update_time: std::time::Instant::now(),
-        }
+        let bytes = Arc::new(AtomicU64::new(0));
+        Self::with_bytes_and_speed(total_bytes, filename, bytes.clone(), bytes)
     }
-    
-    pub fn update(&mut self, current_bytes: u64) {
-        let bytes_since_update = current_bytes.saturating_sub(self.last_update_bytes);
-        let time_since_update = self.last_update_time.elapsed();
-        
-        if bytes_since_update >= PROGRESS_BYTE_INTERVAL || time_since_update >= PROGRESS_TIME_INTERVAL {
-            self.bar.set_position(current_bytes);
-            self.last_update_bytes = current_bytes;
-            self.last_update_time = std::time::Instant::now();
-        }
+
+    pub fn with_bytes(total_bytes: u64, filename: &str, bytes: Arc<AtomicU64>) -> Self {
+        Self::with_bytes_and_speed(total_bytes, filename, bytes.clone(), bytes)
     }
-    
+
+    pub fn with_bytes_and_speed(
+        total_bytes: u64,
+        filename: &str,
+        position_bytes: Arc<AtomicU64>,
+        speed_bytes: Arc<AtomicU64>,
+    ) -> Self {
+        let speed_x100 = Arc::new(AtomicU64::new(0));
+        let bar = create_progress_bar(total_bytes, filename, speed_x100.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = spawn_progress_task(
+            bar.clone(),
+            position_bytes.clone(),
+            speed_bytes.clone(),
+            speed_x100.clone(),
+            stop.clone(),
+            total_bytes,
+        );
+
+        Self { bar, position_bytes, stop, task }
+    }
+
+    pub fn bytes(&self) -> Arc<AtomicU64> {
+        self.position_bytes.clone()
+    }
+
     pub fn set_position(&self, pos: u64) {
         self.bar.set_position(pos);
     }
     
     pub fn finish_with_message(&self, msg: String) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.abort();
         self.bar.finish_with_message(msg);
     }
     
@@ -63,18 +84,70 @@ impl ProgressTracker {
     }
 }
 
-fn create_progress_bar(total_bytes: u64, filename: &str) -> ProgressBar {
+impl Drop for ProgressTracker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
+}
+
+fn create_progress_bar(
+    total_bytes: u64,
+    filename: &str,
+    speed_x100: Arc<AtomicU64>,
+) -> ProgressBar {
     let pb = ProgressBar::new(total_bytes);
     pb.set_style(ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({mbits_per_sec}) {msg}")
         .unwrap()
-        .with_key("mbits_per_sec", |state: &ProgressState, w: &mut dyn FmtWrite| {
-            let mbits_per_sec = state.per_sec() * 8.0 / 1_000_000.0;
+        .with_key("mbits_per_sec", move |_state: &ProgressState, w: &mut dyn FmtWrite| {
+            let mbits_per_sec = speed_x100.load(Ordering::Relaxed) as f64 / 100.0;
             let _ = write!(w, "{:.2} Mbit/s", mbits_per_sec);
         })
         .progress_chars("=>-"));
     pb.set_message(filename.to_string());
     pb
+}
+
+fn spawn_progress_task(
+    bar: ProgressBar,
+    position_bytes: Arc<AtomicU64>,
+    speed_bytes: Arc<AtomicU64>,
+    speed_x100: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    total_bytes: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PROGRESS_TICK);
+        let mut last_speed_bytes = 0_u64;
+        let mut last_tick = Instant::now();
+        let mut ema_mbit = 0.0_f64;
+
+        loop {
+            interval.tick().await;
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let now_pos_raw = position_bytes.load(Ordering::Relaxed);
+            let now_speed_raw = speed_bytes.load(Ordering::Relaxed);
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_tick).as_secs_f64().max(0.000_001);
+            let now_pos = std::cmp::min(now_pos_raw, total_bytes);
+            let delta_bytes = now_speed_raw.saturating_sub(last_speed_bytes) as f64;
+            let inst_mbit = delta_bytes * 8.0 / 1_000_000.0 / elapsed;
+            ema_mbit = if ema_mbit == 0.0 {
+                inst_mbit
+            } else {
+                (1.0 - SPEED_EMA_ALPHA) * ema_mbit + SPEED_EMA_ALPHA * inst_mbit
+            };
+            speed_x100.store((ema_mbit * 100.0) as u64, Ordering::Relaxed);
+
+            bar.set_position(now_pos);
+
+            last_speed_bytes = now_speed_raw;
+            last_tick = now;
+        }
+    })
 }
 
 /// Calculate SHA256 hash of a file

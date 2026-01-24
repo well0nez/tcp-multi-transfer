@@ -2,7 +2,7 @@
 
 High-performance multi-TCP file transfer with NAT traversal (hole punching).
 
-Current version: v0.9.2
+Current version: v0.9.3
 
 Successor to the single-connection prototype at https://github.com/well0nez/tcp-transfer-ice.  
 This version extends the same relay + NAT probing model with coordinated multi-connection punching while keeping direct P2P TCP and SHA256 integrity checks.

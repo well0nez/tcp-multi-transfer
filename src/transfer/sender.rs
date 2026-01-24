@@ -20,6 +20,9 @@ use super::helpers::*;
 /// Buffer size for file I/O (16MB)
 const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
+/// Progress update chunk size for socket writes (256KB)
+const PROGRESS_IO_CHUNK: usize = 256 * 1024;
+
 /// Pipeline depth for async I/O (16 chunks = ~128MB in flight at 8MB chunks)
 const PIPELINE_DEPTH: usize = 16;
 
@@ -112,6 +115,22 @@ async fn read_chunk_ack_message(stream: &mut TcpStream) -> Result<ChunkAckMessag
     ChunkAckMessage::decode(&buf).ok_or_else(|| anyhow!("Failed to parse CHUNK_ACK"))
 }
 
+async fn write_payload_with_progress(
+    stream: &mut TcpStream,
+    buf: &[u8],
+    timeout: Duration,
+    counter: &Arc<AtomicU64>,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        let end = std::cmp::min(offset + PROGRESS_IO_CHUNK, buf.len());
+        write_all_timeout(stream, &buf[offset..end], timeout).await?;
+        counter.fetch_add((end - offset) as u64, Ordering::Relaxed);
+        offset = end;
+    }
+    Ok(())
+}
+
 pub struct TcpSender {
     stream: TcpStream,
     file_path: String,
@@ -130,7 +149,8 @@ impl TcpSender {
         send_file_info_on_stream(&mut self.stream, &self.file_path, self.file_size, self.sha256).await?;
         
         let filename = Path::new(&self.file_path).file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-        let mut progress = ProgressTracker::new(self.file_size, filename);
+        let progress = ProgressTracker::new(self.file_size, filename);
+        let sent_bytes = progress.bytes();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(PIPELINE_DEPTH);
         let chunk_size = super::get_chunk_size();
         let file_path = self.file_path.clone();
@@ -151,9 +171,8 @@ impl TcpSender {
         
         let mut total_sent: u64 = 0;
         while let Some(data) = rx.recv().await {
-            write_all_timeout(&mut self.stream, &data, IO_TIMEOUT).await?;
+            write_payload_with_progress(&mut self.stream, &data, IO_TIMEOUT, &sent_bytes).await?;
             total_sent += data.len() as u64;
-            progress.update(total_sent);
         }
         
         reader_handle.await.map_err(|e| anyhow!("Reader task panicked: {}", e))??;
@@ -209,9 +228,10 @@ pub async fn run_multi_sender(
     let notify = Arc::new(Notify::new());
     let completed_chunks = Arc::new(AtomicUsize::new(0));
     let completed_bytes = Arc::new(AtomicU64::new(0));
+    let sent_bytes = Arc::new(AtomicU64::new(0));
     
     let filename = Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-    let mut progress = ProgressTracker::new(file_size, filename);
+    let progress = ProgressTracker::with_bytes_and_speed(file_size, filename, sent_bytes.clone(), completed_bytes.clone());
     
     let mut handles = Vec::new();
     for stream in streams {
@@ -220,17 +240,16 @@ pub async fn run_multi_sender(
         let notify = notify.clone();
         let completed_chunks = completed_chunks.clone();
         let completed_bytes = completed_bytes.clone();
+        let sent_bytes = sent_bytes.clone();
         handles.push(tokio::spawn(async move {
-            sender_worker(stream, file_path, file_size, pending, notify, completed_chunks, completed_bytes, total_chunks, chunk_size).await
+            sender_worker(stream, file_path, file_size, pending, notify, completed_chunks, completed_bytes, sent_bytes, total_chunks, chunk_size).await
         }));
     }
     
     loop {
-        let done_bytes = completed_bytes.load(Ordering::Relaxed);
-        progress.update(done_bytes);
         if completed_chunks.load(Ordering::Relaxed) as u32 >= total_chunks { break; }
         if handles.iter().all(|h| h.is_finished()) { break; }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     
     let mut returned_streams = Vec::new();
@@ -252,6 +271,7 @@ pub async fn run_multi_sender(
     read_exact_timeout(&mut done_stream, &mut ack_buf, Duration::from_secs(120)).await?;
     if ack_buf[0] != MessageType::Ack as u8 { return Err(anyhow!("Expected final ACK")); }
     
+    progress.set_position(file_size);
     progress.finish_with_message("Transfer complete!".to_string());
     Ok(())
 }
@@ -264,6 +284,7 @@ async fn sender_worker(
     notify: Arc<Notify>,
     completed_chunks: Arc<AtomicUsize>,
     completed_bytes: Arc<AtomicU64>,
+    sent_bytes: Arc<AtomicU64>,
     total_chunks: u32,
     chunk_size: usize,
 ) -> Result<TcpStream> {
@@ -299,7 +320,7 @@ async fn sender_worker(
         let header = ChunkHeaderMessage { chunk_id, offset, len: len as u32, hash32 };
         
         write_all_timeout(&mut stream, &header.encode(), IO_TIMEOUT).await?;
-        write_all_timeout(&mut stream, &buffer[..len], IO_TIMEOUT).await?;
+        write_payload_with_progress(&mut stream, &buffer[..len], IO_TIMEOUT, &sent_bytes).await?;
         
         match read_chunk_ack_message(&mut stream).await {
             Ok(ack) if ack.is_nack => {

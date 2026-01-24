@@ -5,7 +5,7 @@
 //! - BUFFER_SIZE: 16MB for efficient I/O
 //! - TCP Socket buffers: 64MB send/recv (OS may cap lower)
 //! - Pipeline Depth: 16 chunks (~128MB in flight)
-//! - Hybrid progress: every 10MB OR every 2 seconds
+//! - Periodic progress updates (200ms) with atomic byte counters
 //! - SHA256 only at the end (from disk)
 //! - CRC32 per chunk during transfer with ACK/NACK
 //! - Pipelined I/O - Disk reads and network writes run in parallel!
