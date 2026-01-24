@@ -226,6 +226,10 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
     if streams.is_empty() { return Err(anyhow!("No streams")); }
     info!("Using {} streams in connection order", streams.len());
     
+    for stream in streams.iter() {
+        configure_tcp_socket(stream)?;
+    }
+    
     // Handshake + FileInfo only on first stream (heavy protocol setup)
     let mut file_info: Option<FileInfoMessage> = None;
     for (i, stream) in streams.iter_mut().enumerate() {
@@ -307,6 +311,7 @@ async fn receiver_worker(
     let mut file = OpenOptions::new().write(true).open(&temp_path).await?;
     let _chunk_size = super::get_chunk_size();
     let _total_chunks = received_flags.len() as u32;
+    let mut data = Vec::new();
     
     loop {
         if done_received.load(Ordering::Relaxed) { break; }
@@ -330,11 +335,14 @@ async fn receiver_worker(
                 header_buf[1..].copy_from_slice(&header_rest);
                 let header = ChunkHeaderMessage::decode(&header_buf).unwrap();
                 
-                let mut data = vec![0u8; header.len as usize];
-                read_exact_timeout(&mut stream, &mut data, IO_TIMEOUT).await?;
+                let data_len = header.len as usize;
+                if data.len() < data_len {
+                    data.resize(data_len, 0u8);
+                }
+                read_exact_timeout(&mut stream, &mut data[..data_len], IO_TIMEOUT).await?;
                 
                 let mut hasher = Hasher::new();
-                hasher.update(&data);
+                hasher.update(&data[..data_len]);
                 if hasher.finalize() != header.hash32 {
                     let nack = ChunkAckMessage { chunk_id: header.chunk_id, is_nack: true };
                     write_all_timeout(&mut stream, &nack.encode(), IO_TIMEOUT).await?;
@@ -342,7 +350,7 @@ async fn receiver_worker(
                 }
                 
                 file.seek(std::io::SeekFrom::Start(header.offset)).await?;
-                file.write_all(&data).await?;
+                file.write_all(&data[..data_len]).await?;
                 
                 if !received_flags[header.chunk_id as usize].swap(true, Ordering::AcqRel) {
                     received_count.fetch_add(1, Ordering::Relaxed);

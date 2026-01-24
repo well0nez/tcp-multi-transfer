@@ -185,6 +185,10 @@ pub async fn run_multi_sender(
     if streams.is_empty() { return Err(anyhow!("No streams")); }
     info!("Using {} streams in connection order", streams.len());
     
+    for stream in streams.iter() {
+        configure_tcp_socket(stream)?;
+    }
+    
     let total_streams = streams.len();
     for (i, stream) in streams.iter_mut().enumerate() {
         // Handshake + FileInfo only on first stream (heavy protocol setup)
