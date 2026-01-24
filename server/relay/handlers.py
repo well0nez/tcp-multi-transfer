@@ -383,6 +383,13 @@ async def handle_conn_result(msg: dict, peer: Peer, session_manager, status: str
         peer.conn_results[conn_num] = status
         if reason:
             peer.conn_reasons[conn_num] = str(reason)
+        session = session_manager.sessions.get(session_id)
+        if session is not None:
+            results = session.setdefault('conn_results', {'sender': {}, 'receiver': {}})
+            results[peer.role][conn_num] = status
+            if reason:
+                reasons = session.setdefault('conn_reasons', {'sender': {}, 'receiver': {}})
+                reasons[peer.role][conn_num] = str(reason)
     
     if reason:
         logger.info(f"Peer {peer.role} reported {status} for connection {conn_num} (reason={reason})")

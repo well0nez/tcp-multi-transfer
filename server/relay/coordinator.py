@@ -19,6 +19,7 @@ async def coordinate_multi_connections(
 ):
     """Coordinates multiple hole-punch cycles for multi-connection support."""
     lock = session_manager.get_session_lock(session_id)
+    coordination_started = False
     
     async with lock:
         session = session_manager.sessions.get(session_id)
@@ -32,118 +33,142 @@ async def coordinate_multi_connections(
         if not sender or not receiver:
             logger.error(f"Session {session_id}: Missing sender or receiver")
             return
-    
-    logger.info(f"Session {session_id}: Starting multi-connection coordination ({tcp_connections} connections)")
-    
-    for conn_num in range(tcp_connections):
-        logger.info(f"Session {session_id}: Coordinating connection {conn_num+1}/{tcp_connections}")
         
-        max_port_wait = 60.0
-        port_wait_start = time.time()
-        skip_connection = False
-        while True:
-            # If both peers already reported a result, skip coordination.
-            async with lock:
-                sender_result = sender.conn_results.get(conn_num)
-                receiver_result = receiver.conn_results.get(conn_num)
-            if sender_result and receiver_result:
-                logger.info(
-                    f"Session {session_id}: Connection {conn_num} already resolved "
-                    f"(sender={sender_result}, receiver={receiver_result})"
-                )
-                skip_connection = True
-                break
-            
-            sender_has_port = conn_num < len(sender.bound_ports)
-            receiver_has_port = conn_num < len(receiver.bound_ports)
-            
-            if sender_has_port and receiver_has_port:
-                logger.debug(f"Session {session_id}: Both peers have port for connection {conn_num}")
-                break
-            
-            if time.time() - port_wait_start > max_port_wait:
-                logger.warning(
-                    f"Session {session_id}: Still waiting for ports (conn {conn_num}) - "
-                    f"sender={len(sender.bound_ports)} ports, receiver={len(receiver.bound_ports)} ports"
-                )
-                port_wait_start = time.time()
-                warned = True
-            
-            await asyncio.sleep(0.05)
-
-        if skip_connection:
-            continue
-
-        # Clear any stale results before coordinating this connection
-        async with lock:
-            sender.conn_results.pop(conn_num, None)
-            receiver.conn_results.pop(conn_num, None)
-            sender.conn_reasons.pop(conn_num, None)
-            receiver.conn_reasons.pop(conn_num, None)
+        session['coordination_active'] = True
+        coordination_started = True
+    try:
+        logger.info(f"Session {session_id}: Starting multi-connection coordination ({tcp_connections} connections)")
         
-        await send_peer_info_for_connection(
-            session_id,
-            sender,
-            receiver,
-            conn_num,
-            max_scan_ports,
-            session_manager
-        )
-        
-        max_wait = 60.0
-        start_wait = time.time()
-        
-        while True:
-            async with lock:
-                sender_ready = sender.ready_for_connection.get(conn_num, False)
-                receiver_ready = receiver.ready_for_connection.get(conn_num, False)
-                
-                if sender_ready and receiver_ready:
-                    logger.info(f"Session {session_id}: Both peers ready for connection {conn_num}")
+        for conn_num in range(tcp_connections):
+            logger.info(f"Session {session_id}: Coordinating connection {conn_num+1}/{tcp_connections}")
+            
+            max_port_wait = 60.0
+            port_wait_start = time.time()
+            skip_connection = False
+            while True:
+                # If both peers already reported a result, skip coordination.
+                async with lock:
+                    session = session_manager.sessions.get(session_id)
+                    session_results = (session or {}).get('conn_results') or {}
+                    sender_result = session_results.get('sender', {}).get(conn_num) or sender.conn_results.get(conn_num)
+                    receiver_result = session_results.get('receiver', {}).get(conn_num) or receiver.conn_results.get(conn_num)
+                if sender_result and receiver_result:
+                    logger.info(
+                        f"Session {session_id}: Connection {conn_num} already resolved "
+                        f"(sender={sender_result}, receiver={receiver_result})"
+                    )
+                    skip_connection = True
                     break
                 
-                if time.time() - start_wait > max_wait:
-                    logger.error(f"Session {session_id}: Timeout waiting for READYs (conn {conn_num})")
-                    return
-            
-            await asyncio.sleep(0.1)
-        
-        start_at = time.time() + 1.5
-        go_msg = {
-            'type': 'go',
-            'start_at': start_at,
-            'connection_num': conn_num,
-            'message': f'Connection {conn_num+1}/{tcp_connections}'
-        }
-        
-        await send_message(sender.writer, go_msg)
-        await send_message(receiver.writer, go_msg)
-        
-        logger.info(f"Session {session_id}: GO sent for connection {conn_num+1} at {start_at:.3f}")
-        
-        async with lock:
-            sender.ready_for_connection[conn_num] = False
-            receiver.ready_for_connection[conn_num] = False
+                sender_has_port = conn_num < len(sender.bound_ports)
+                receiver_has_port = conn_num < len(receiver.bound_ports)
+                
+                if sender_has_port and receiver_has_port:
+                    logger.debug(f"Session {session_id}: Both peers have port for connection {conn_num}")
+                    break
+                
+                if time.time() - port_wait_start > max_port_wait:
+                    logger.warning(
+                        f"Session {session_id}: Still waiting for ports (conn {conn_num}) - "
+                        f"sender={len(sender.bound_ports)} ports, receiver={len(receiver.bound_ports)} ports"
+                    )
+                    port_wait_start = time.time()
+                
+                await asyncio.sleep(0.05)
 
-        # Wait for both peers to report the connection result before proceeding
-        result = await wait_for_connection_result(
-            session_id,
-            session_manager,
-            conn_num,
-            timeout=300.0,
-        )
-        if not result:
-            logger.error(f"Session {session_id}: Timeout waiting for connection {conn_num} result")
-            return
-        
-        sender_result, receiver_result = result
-        logger.info(
-            f"Session {session_id}: Connection {conn_num} results "
-            f"(sender={sender_result}, receiver={receiver_result})"
-        )
-        
-        if conn_num < tcp_connections - 1:
-            await asyncio.sleep(0.1)
+            if skip_connection:
+                continue
+
+            # Clear any stale results before coordinating this connection
+            async with lock:
+                sender.conn_results.pop(conn_num, None)
+                receiver.conn_results.pop(conn_num, None)
+                sender.conn_reasons.pop(conn_num, None)
+                receiver.conn_reasons.pop(conn_num, None)
+                session = session_manager.sessions.get(session_id)
+                if session:
+                    session_results = session.get('conn_results')
+                    if session_results:
+                        session_results.get('sender', {}).pop(conn_num, None)
+                        session_results.get('receiver', {}).pop(conn_num, None)
+                    session_reasons = session.get('conn_reasons')
+                    if session_reasons:
+                        session_reasons.get('sender', {}).pop(conn_num, None)
+                        session_reasons.get('receiver', {}).pop(conn_num, None)
+            
+            await send_peer_info_for_connection(
+                session_id,
+                sender,
+                receiver,
+                conn_num,
+                max_scan_ports,
+                session_manager
+            )
+            
+            max_wait = 60.0
+            start_wait = time.time()
+            
+            while True:
+                async with lock:
+                    sender_ready = sender.ready_for_connection.get(conn_num, False)
+                    receiver_ready = receiver.ready_for_connection.get(conn_num, False)
+                    
+                    if sender_ready and receiver_ready:
+                        logger.info(f"Session {session_id}: Both peers ready for connection {conn_num}")
+                        break
+                    
+                    if time.time() - start_wait > max_wait:
+                        logger.error(f"Session {session_id}: Timeout waiting for READYs (conn {conn_num})")
+                        return
+                
+                await asyncio.sleep(0.1)
+            
+            start_at = time.time() + 1.5
+            go_msg = {
+                'type': 'go',
+                'start_at': start_at,
+                'connection_num': conn_num,
+                'message': f'Connection {conn_num+1}/{tcp_connections}'
+            }
+            
+            await send_message(sender.writer, go_msg)
+            await send_message(receiver.writer, go_msg)
+            
+            logger.info(f"Session {session_id}: GO sent for connection {conn_num+1} at {start_at:.3f}")
+            
+            async with lock:
+                sender.ready_for_connection[conn_num] = False
+                receiver.ready_for_connection[conn_num] = False
+
+            # Wait for both peers to report the connection result before proceeding
+            result = await wait_for_connection_result(
+                session_id,
+                session_manager,
+                conn_num,
+                timeout=300.0,
+            )
+            if not result:
+                logger.error(f"Session {session_id}: Timeout waiting for connection {conn_num} result")
+                return
+            
+            sender_result, receiver_result = result
+            logger.info(
+                f"Session {session_id}: Connection {conn_num} results "
+                f"(sender={sender_result}, receiver={receiver_result})"
+            )
+            
+            if conn_num < tcp_connections - 1:
+                await asyncio.sleep(0.1)
+    finally:
+        if coordination_started:
+            async with lock:
+                session = session_manager.sessions.get(session_id)
+                if session:
+                    session['coordination_active'] = False
+                    if not session.get('sender') and not session.get('receiver'):
+                        session_manager.sessions.pop(session_id, None)
+                        session_manager.pending_probes.pop(session_id, None)
+                        session_manager.peer_info_sent.pop(session_id, None)
 
 
 async def coordinate_retry_connection(
@@ -234,14 +259,51 @@ async def wait_for_connection_result(
             
             sender = session.get('sender')
             receiver = session.get('receiver')
-            if not sender or not receiver:
-                logger.error(f"Session {session_id}: Missing peer while waiting for conn {conn_num} result")
-                return None
-            
-            sender_result = sender.conn_results.get(conn_num)
-            receiver_result = receiver.conn_results.get(conn_num)
+            session_results = session.setdefault('conn_results', {'sender': {}, 'receiver': {}})
+            session_reasons = session.setdefault('conn_reasons', {'sender': {}, 'receiver': {}})
+
+            sender_result = session_results.get('sender', {}).get(conn_num)
+            receiver_result = session_results.get('receiver', {}).get(conn_num)
+
+            if sender and not sender_result:
+                live = sender.conn_results.get(conn_num)
+                if live:
+                    session_results['sender'][conn_num] = live
+                    sender_result = live
+                    reason = sender.conn_reasons.get(conn_num)
+                    if reason:
+                        session_reasons['sender'][conn_num] = reason
+
+            if receiver and not receiver_result:
+                live = receiver.conn_results.get(conn_num)
+                if live:
+                    session_results['receiver'][conn_num] = live
+                    receiver_result = live
+                    reason = receiver.conn_reasons.get(conn_num)
+                    if reason:
+                        session_reasons['receiver'][conn_num] = reason
             
             if sender_result and receiver_result:
+                return sender_result, receiver_result
+            
+            missing = []
+            if not sender and not sender_result:
+                session_results['sender'][conn_num] = "abandoned"
+                session_reasons['sender'][conn_num] = "peer_missing"
+                sender_result = "abandoned"
+                missing.append("sender")
+            
+            if not receiver and not receiver_result:
+                session_results['receiver'][conn_num] = "abandoned"
+                session_reasons['receiver'][conn_num] = "peer_missing"
+                receiver_result = "abandoned"
+                missing.append("receiver")
+            
+            if missing and sender_result and receiver_result:
+                logger.warning(
+                    f"Session {session_id}: Peer(s) {', '.join(missing)} missing; "
+                    f"marking conn {conn_num} as abandoned"
+                )
                 return sender_result, receiver_result
         
         elapsed = time.time() - start

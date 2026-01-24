@@ -62,7 +62,12 @@ class SessionManager:
             if session and peer.role in session:
                 if session[peer.role] is peer:
                     del session[peer.role]
-                if not session:
+            if session:
+                sender = session.get('sender')
+                receiver = session.get('receiver')
+                if not sender and not receiver:
+                    if session.get('coordination_active'):
+                        return
                     del self.sessions[session_id]
                     if session_id in self.pending_probes:
                         del self.pending_probes[session_id]
