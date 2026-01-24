@@ -47,7 +47,7 @@ async def wait_for_peer_messages(peer: Peer, session_manager, max_scan_ports: in
             
             elif msg_type == 'retry_request':
                 logger.info(f"Peer {peer.role} sent retry_request")
-                await handle_retry_request(msg, peer, session_manager)
+                await handle_retry_request(msg, peer, session_manager, max_scan_ports)
             
         except asyncio.TimeoutError:
             try:
@@ -215,7 +215,7 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
                 )
 
 
-async def handle_retry_request(msg: dict, peer: Peer, session_manager):
+async def handle_retry_request(msg: dict, peer: Peer, session_manager, max_scan_ports: int):
     """Handle retry_request from client."""
     conn_num = msg.get('connection_num')
     if conn_num is None:
@@ -278,7 +278,7 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager):
             session['retry_add_ports_pending'][conn_num] = {
                 'sender': False,
                 'receiver': False,
-                'max_scan_ports': sender.scan_budget or receiver.scan_budget or 100
+                'max_scan_ports': max_scan_ports,
             }
             
             logger.info(f"Session {session_id}: Retry granted for connection {conn_num}, waiting for add_ports from BOTH peers")
