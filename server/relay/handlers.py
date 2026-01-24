@@ -70,7 +70,7 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
     
     logger.info(f"Peer {peer.role} added {len(ports)} new ports: {ports}")
     
-    peer.bound_ports.extend(ports)
+    retry_mapped = False
     
     if session_id in session_manager.pending_probes:
         probes = session_manager.pending_probes[session_id]
@@ -115,6 +115,22 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
             if 'retry_add_ports_pending' in session and session.get('retry_add_ports_pending'):
                 for conn_num, pending in list(session['retry_add_ports_pending'].items()):
                     if not pending.get(peer.role):
+                        # Map the new retry port to the original connection index
+                        new_port = ports[0]
+                        if conn_num < len(peer.bound_ports):
+                            old_port = peer.bound_ports[conn_num]
+                            peer.bound_ports[conn_num] = new_port
+                            logger.info(
+                                f"Session {session_id}: Retry port mapped for {peer.role} conn {conn_num} "
+                                f"({old_port} -> {new_port})"
+                            )
+                        else:
+                            peer.bound_ports.append(new_port)
+                            logger.warning(
+                                f"Session {session_id}: Retry port mapped for {peer.role} conn {conn_num} "
+                                f"(appended {new_port})"
+                            )
+                        retry_mapped = True
                         pending[peer.role] = True
                         logger.info(f"Session {session_id}: Peer {peer.role} sent add_ports for retry connection {conn_num}")
                         
@@ -141,6 +157,9 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
                             logger.info(f"Session {session_id}: Retry coordination task started for connection {conn_num}")
                         
                         break
+
+    if not retry_mapped:
+        peer.bound_ports.extend(ports)
 
 
 async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: int):
