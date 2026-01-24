@@ -48,8 +48,8 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/release/tcp-transfer-ice dist/
-          cp tcp_server_ice_NEW.py dist/
+          cp target/release/tcp-multi-transfer dist/
+          cp run_server.py dist/
           cp README.md dist/
 
       - name: Prepare dist (windows)
@@ -57,8 +57,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target\release\tcp-transfer-ice.exe dist\
-          Copy-Item tcp_server_ice_NEW.py dist\
+          Copy-Item target\release\tcp-multi-transfer.exe dist\
+          Copy-Item run_server.py dist\
           Copy-Item README.md dist\
 
       - name: Create archive (unix)
@@ -69,7 +69,7 @@ jobs:
           import zipfile
 
           label = "${{ matrix.label }}"
-          archive = f"tcp-transfer-ice-{label}.zip"
+          archive = f"tcp-multi-transfer-{label}.zip"
           base_dir = "dist"
 
           with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -89,7 +89,7 @@ jobs:
           import zipfile
 
           label = "${{ matrix.label }}"
-          archive = f"tcp-transfer-ice-{label}.zip"
+          archive = f"tcp-multi-transfer-{label}.zip"
           base_dir = "dist"
 
           with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -103,8 +103,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tcp-transfer-ice-${{ matrix.label }}
-          path: tcp-transfer-ice-${{ matrix.label }}.zip
+          name: tcp-multi-transfer-${{ matrix.label }}
+          path: tcp-multi-transfer-${{ matrix.label }}.zip
 
   release:
     name: Publish release
@@ -119,5 +119,5 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/tcp-transfer-ice-*.zip
+          files: artifacts/**/tcp-multi-transfer-*.zip
           generate_release_notes: true

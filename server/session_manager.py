@@ -57,19 +57,32 @@ class SessionManager:
     async def cleanup_peer(self, session_id: str, peer: Peer):
         """Clean up peer from session"""
         lock = self.get_session_lock(session_id)
+        other_peer = None
         async with lock:
             session = self.sessions.get(session_id)
-            if session and peer.role in session:
-                if session[peer.role] is peer:
-                    del session[peer.role]
-            if session:
-                sender = session.get('sender')
-                receiver = session.get('receiver')
-                if not sender and not receiver:
-                    if session.get('coordination_active'):
-                        return
-                    del self.sessions[session_id]
-                    if session_id in self.pending_probes:
-                        del self.pending_probes[session_id]
-                    if session_id in self.peer_info_sent:
-                        del self.peer_info_sent[session_id]
+            if not session:
+                return
+
+            if peer.role in session and session[peer.role] is peer:
+                del session[peer.role]
+
+            other_role = 'sender' if peer.role == 'receiver' else 'receiver'
+            other_peer = session.get(other_role)
+            if other_peer:
+                del session[other_role]
+
+            # Always clear the session if any peer disconnects.
+            self.sessions.pop(session_id, None)
+            self.pending_probes.pop(session_id, None)
+            self.peer_info_sent.pop(session_id, None)
+
+        if other_peer:
+            logger.warning(
+                f"Session {session_id}: {peer.role} disconnected - closing {other_peer.role} and clearing session"
+            )
+            try:
+                if not other_peer.writer.is_closing():
+                    other_peer.writer.close()
+                await other_peer.writer.wait_closed()
+            except Exception:
+                pass

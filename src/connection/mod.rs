@@ -410,9 +410,6 @@ pub async fn establish_multi_connections(
                     }
                 }
                 
-                _ => {
-                    return Err(anyhow!("Unexpected connection state: {:?}", state));
-                }
             };
             
             if abandon_reason.is_some() {

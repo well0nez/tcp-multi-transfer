@@ -710,8 +710,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "tcp-transfer-ice"
-version = "0.5.3"
+name = "tcp-multi-transfer"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "bytes",

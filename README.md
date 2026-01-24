@@ -1,8 +1,11 @@
-# TCP File Transfer Client
+# tcp-multi-transfer
 
-High-performance TCP file transfer with NAT traversal (hole punching).
+High-performance multi-TCP file transfer with NAT traversal (hole punching).
 
-A TCP file-transfer tool with NAT traversal (TCP hole punching) coordinated by a lightweight relay. It probes NAT behavior to build a bounded port candidate list, improving success against tricky NAT types without relaying traffic. Once connected, it uses direct P2P TCP with SHA256 integrity checks for reliable transfer.
+Current version: v0.9.0
+
+Successor to the single-connection prototype at https://github.com/well0nez/tcp-transfer-ice.  
+This version extends the same relay + NAT probing model with coordinated multi-connection punching while keeping direct P2P TCP and SHA256 integrity checks.
 
 ## Features
 
@@ -21,11 +24,30 @@ A TCP file-transfer tool with NAT traversal (TCP hole punching) coordinated by a
 4. Once connected, the file is transferred directly peer-to-peer
 5. SHA256 verification ensures file integrity
 
+## Sequential Multi-Connection Punching (Workflow)
+
+For multi-TCP sessions, the relay coordinates **one connection at a time** to keep both peers synchronized
+and to prevent NAT prediction drift:
+
+- **Sequential coordination**: For connection *n*, the relay sends `peer_info` + `GO`, then waits for
+  **both** peers to report `conn_established` or `conn_abandoned` before moving to connection *n+1*.
+- **On-demand ports**: Clients bind a fresh local port per connection (and per retry) and announce it
+  via `add_ports`. The relay maps that port to the current connection.
+- **Retries are symmetric**: A retry only starts after **both peers** request it and have provided new ports.
+
+Behavior by NAT type:
+- **NAT-friendly (port-preserved / stable delta)**: The peer list is usually a single candidate port.
+  Punching is fast; sequential mode mainly enforces timing and clean state transitions.
+- **Symmetric / random-like NATs**: The relay sends a bounded scan list derived from probes.
+  Sequential coordination reduces scan load and keeps both peers aligned on the same candidate set.
+  Optional fallback (`--allow-fallback`, `--min-connections`) lets you proceed with fewer streams if needed.
+
 ## Port Prediction and Scan Method
 
 The relay server runs a short NAT probing phase when a peer does not preserve ports:
 
-- The client opens several quick probe connections to `--probe-port` (server waits for at least 5).
+- The client opens `--probe-count` quick probe connections to `--probe-port`.
+  The server uses whatever it receives (analysis is most meaningful with >=2).
 - The server records `(local_port, observed_public_port, timestamp)` and computes a prediction model:
   - delta = public_port - local_port
   - predicted_port = local_port + median(delta)
@@ -72,13 +94,13 @@ raising this to around 20-50 can materially improve success rates.
 
 ### Probe Debug Mode
 
-Use `--probe-debug` to run only the probe phase and print summary stats
-(min/max/range/median/stdev) plus an estimated NAT type. The probe port is derived as `server_port - 1`
-(for example, `--server 1.2.3.4:9999` probes `1.2.3.4:9998`).
+Use `--probe-debug` to resolve and print the relay endpoint and exit (no probe traffic).
+The probe port is provided by the server in the `registered` response when probing is required
+(server default is `9998`).
 
 Example:
 ```bash
-./tcp-transfer -s 1.2.3.4:9999 -i test -m receive --probe-debug --probe-count 25
+./tcp-multi-transfer -s 1.2.3.4:9999 -i test -m receive --probe-debug
 ```
 
 ## Usage
@@ -87,7 +109,7 @@ Example:
 
 Start the relay server:
 ```bash
-python3 tcp_server_ice_NEW.py --port 9999 --probe-port 9998 --max-scan-ports 512
+python3 run_server.py --port 9999 --probe-port 9998 --max-scan-ports 512
 ```
 Ensure both ports are reachable from the public Internet.
 
@@ -102,42 +124,55 @@ Relay server options:
 ### Receiver (start first)
 
 ```bash
-./tcp-transfer -s relay-server:9999 -i my-session -m receive
+./tcp-multi-transfer -s relay-server:9999 -i my-session -m receive
 ```
 
 ### Sender
 
 ```bash
-./tcp-transfer -s relay-server:9999 -i my-session -m send -f myfile.mp4
+./tcp-multi-transfer -s relay-server:9999 -i my-session -m send -f myfile.mp4
 ```
 
 ### Options
 
 ```
 Options:
-  -s, --server <SERVER>      Relay server address (host:port)
-  -i, --session-id <ID>      Session ID (both peers must use the same)
-  -m, --mode <MODE>          Mode: send or receive
-  -f, --file <FILE>          File to send (sender mode only)
-      --timeout <SECONDS>    Hole punch timeout [default: 30]
-      --probe-count <N>      NAT probe connection count [default: 10]
-      --probe-debug          Run probe-only debug mode and print summary stats
-      --prediction-mode <MODE>  NAT prediction mode: delta or external [default: delta]
-      --prediction-range-extra-pct <PCT>  Expand scan range by percentage [default: 0]
-      --chunk <SIZE>         Chunk size for transfer (e.g., 512KB, 1MB) [default: 8MB]
-      --debug                Enable debug logging
-      --tcp-connections <N>  Number of parallel TCP connections (multi TCP) [default: 1]
-      --scan-budget <N>      Global scan budget across all connections (0 = unlimited) [default: 1024]
-      --punch-overshoot <N>  Overshoot factor for hole punching (starts N*tcp_connections punches) [default: 2]
-      --allow-fallback       Allow fallback if fewer connections are established
-      --min-connections <N>  Minimum connections required when fallback is enabled [default: 1]
-      --chunk <CHUNK>        Chunk size for transfer (e.g., 512KB, 1MB, 4MB) [default: 4MB]
-  -h, --help                 Print help
-  -V, --version              Print version
+  -s, --server <SERVER>
+          Relay server address (host:port)
+  -i, --session-id <SESSION_ID>
+          Session ID (both sender and receiver must use the same ID)
+  -m, --mode <MODE>
+          Mode: send or receive [possible values: send, receive]
+  -f, --file <FILE>
+          File to send (sender mode only)
+      --timeout <TIMEOUT>
+          Hole punch timeout in seconds [default: 30]
+      --probe-count <PROBE_COUNT>
+          Number of NAT probes to send [default: 10]
+      --probe-debug
+          Run probe-only debug mode
+      --prediction-mode <PREDICTION_MODE>
+          NAT prediction mode [default: delta] [possible values: delta, external]
+      --prediction-range-extra-pct <PREDICTION_RANGE_EXTRA_PCT>
+          Expand prediction scan range by percentage [default: 0]
+      --debug
+          Enable debug logging
+      --chunk <CHUNK>
+          Chunk size for transfer (e.g., 512KB, 1MB, 2MB) [default: 8MB]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 
-Multi-TCP options:
-      --tcp-connections <N>  Number of parallel TCP connections [default: 1, allowed: 1,2,4,8]
-      --scan-budget <N>      Global scan budget across all connections (0 = unlimited) [default: 1024]
+Multi-TCP:
+      --tcp-connections <TCP_CONNECTIONS>
+          Number of parallel TCP connections (multi TCP) [default: 1]
+      --max-attempts <MAX_ATTEMPTS>
+          Maximum number of sequential punch attempts [default: 20]
+      --allow-fallback
+          Allow fallback to fewer connections if punch fails
+      --min-connections <MIN_CONNECTIONS>
+          Minimum number of connections required (if fallback allowed) [default: 1]
 ```
 
 
@@ -147,17 +182,17 @@ Multi-TCP options:
 cargo build --release
 ```
 
-The binary will be at `target/release/tcp-transfer`.
+The binary will be at `target/release/tcp-multi-transfer`.
 
 ## Protocol
 
 ### Relay Server Protocol (JSON over TCP)
 
 1. **Registration**: Client sends `{"type": "register", "session_id": "...", "role": "sender|receiver", "local_port": 12345}`
-   - Optional for Multi-TCP: `"tcp_connections": N` and `"local_ports": [..]`
+   - Optional for Multi-TCP: `"tcp_connections": N` and `"extra_ports": [..]`
 2. **Registered**: Server responds `{"type": "registered", "your_public_addr": ["ip", port], "needs_probing": true|false, "probe_port": 9998}`
 3. **Peer Info**: When both peers are connected, server sends `{"type": "peer_info", "peer_public_addr": ["ip", port], "peer_addresses": [...], "peer_nat_analysis": {...}}`
-   - Optional: `peer_port_analyses` list with per-local-port NAT analysis
+   - Multi-connection hints include `connection_num` and `peer_extra_ports` when available.
 
 ### File Transfer Protocol (Binary over direct TCP)
 
@@ -195,13 +230,13 @@ If hole punching fails, consider:
 1. Using a TURN-style relay fallback
 2. Retrying multiple times for random-port or symmetric NATs (success can be probabilistic)
 
-### Connection timeout
-
-Increase the timeout: `--timeout 60`
-
 ### Debug mode
 
 Use `--debug` for detailed logging.
+
+### Connection timeout
+
+Increase the timeout: `--timeout 60`
 
 ## References
 

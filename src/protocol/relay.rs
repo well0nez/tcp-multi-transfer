@@ -147,8 +147,6 @@ pub struct PeerAddressInfo {
     #[allow(dead_code)]
     pub ip: String,
     pub port: u16,
-    #[allow(dead_code)]
-    pub addr_type: String,  // Passt zu Server-JSON "addr_type", kein rename mehr!
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

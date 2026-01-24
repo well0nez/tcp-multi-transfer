@@ -32,7 +32,7 @@ use transfer::{
 struct LocalTime;
 
 impl FormatTime for LocalTime {
-    fn format_time(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         let now = chrono::Local::now();
         write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S%.2f"))
     }
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
     let chunk_size = parse_chunk_size(&args.chunk)?;
     set_chunk_size(chunk_size);
     
-    info!("TCP File Transfer Client v{} (ICE)", APP_VERSION);
+    info!("tcp-multi-transfer v{} (ICE)", APP_VERSION);
     info!("===================================");
     info!("TCP connections: {}", args.tcp_connections);
     

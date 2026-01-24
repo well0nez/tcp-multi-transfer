@@ -8,9 +8,6 @@ use super::types::GoSignal;
 
 #[derive(Debug, Clone)]
 pub enum ConnectionState {
-    #[allow(dead_code)]
-    Initial,
-    
     WaitingForPeerInfo { conn_num: u32 },
     
     WaitingForGO { 
@@ -38,26 +35,6 @@ pub enum ConnectionState {
         conn_num: u32,
         attempt: u32,
     },
-}
-
-impl ConnectionState {
-    #[allow(dead_code)]
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, ConnectionState::Established { .. })
-    }
-    
-    #[allow(dead_code)]
-    pub fn conn_num(&self) -> Option<u32> {
-        match self {
-            ConnectionState::Initial => None,
-            ConnectionState::WaitingForPeerInfo { conn_num } => Some(*conn_num),
-            ConnectionState::WaitingForGO { conn_num, .. } => Some(*conn_num),
-            ConnectionState::Punching { conn_num, .. } => Some(*conn_num),
-            ConnectionState::Established { conn_num } => Some(*conn_num),
-            ConnectionState::Failed { conn_num, .. } => Some(*conn_num),
-            ConnectionState::WaitingForRetry { conn_num, .. } => Some(*conn_num),
-        }
-    }
 }
 
 pub type StateTransition = Result<ConnectionState>;

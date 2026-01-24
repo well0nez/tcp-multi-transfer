@@ -30,10 +30,10 @@ impl PredictionMode {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "tcp-transfer")]
+#[command(name = "tcp-multi-transfer")]
 #[command(author = "TCP Transfer Team")]
 #[command(version)]
-#[command(about = "TCP file transfer with NAT traversal (hole punching)")]
+#[command(about = "Multi-TCP file transfer with NAT traversal (hole punching)")]
 pub struct Args {
     /// Relay server address (host:port)
     #[arg(short, long)]
