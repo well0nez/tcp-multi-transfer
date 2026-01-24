@@ -8,7 +8,7 @@ use clap::Parser;
 use tokio::io::BufReader;
 use anyhow::{Result, anyhow};
 use tracing::{info, error, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::{FmtSubscriber, fmt::time::FormatTime};
 
 mod cli;
 mod protocol;
@@ -29,6 +29,14 @@ use transfer::{
     run_multi_receiver,
 };
 
+struct LocalTime;
+
+impl FormatTime for LocalTime {
+    fn format_time(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S%.2f"))
+    }
+}
 
 async fn run_sender(
     server_addr: &str,
@@ -216,7 +224,13 @@ async fn run_probe_debug(server_addr: &str, session_id: &str, count: u32) -> Res
 async fn main() -> Result<()> {
     let args = Args::parse();
     let level = if args.debug { Level::DEBUG } else { Level::INFO };
-    let _subscriber = FmtSubscriber::builder().with_max_level(level).with_target(false).with_file(false).with_line_number(false).init();
+    let _subscriber = FmtSubscriber::builder()
+        .with_max_level(level)
+        .with_target(false)
+        .with_file(false)
+        .with_line_number(false)
+        .with_timer(LocalTime)
+        .init();
 
     if args.probe_debug {
         return run_probe_debug(&args.server, &args.session_id, args.probe_count).await;

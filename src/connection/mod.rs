@@ -3,7 +3,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use anyhow::{Result, anyhow};
@@ -39,8 +38,50 @@ pub use queue_readers::{
     wait_for_retry_granted_from_queue,
 };
 
-// 🔴 DEBUG: Force first connection 0 to fail for retry testing
-static FIRST_CONN_0_ATTEMPT: AtomicBool = AtomicBool::new(true);
+
+fn port_in_use(bound_sockets: &[socket2::Socket], port: u16, exclude_index: Option<usize>) -> bool {
+    bound_sockets.iter().enumerate().any(|(idx, sock)| {
+        if Some(idx) == exclude_index {
+            return false;
+        }
+        sock.local_addr()
+            .ok()
+            .and_then(|addr| addr.as_socket().map(|s| s.port()))
+            .map(|p| p == port)
+            .unwrap_or(false)
+    })
+}
+
+fn bind_ephemeral_unique(
+    bound_sockets: &[socket2::Socket],
+    exclude_index: Option<usize>,
+) -> Result<(socket2::Socket, u16)> {
+    for attempt in 0..10 {
+        match create_bound_socket(0) {
+            Ok(sock) => {
+                let new_port = sock
+                    .local_addr()?
+                    .as_socket()
+                    .map(|s| s.port())
+                    .unwrap_or(0);
+                if new_port == 0 {
+                    continue;
+                }
+                if port_in_use(bound_sockets, new_port, exclude_index) {
+                    debug!("Ephemeral port {} already in use, retrying...", new_port);
+                    continue;
+                }
+                return Ok((sock, new_port));
+            }
+            Err(e) => {
+                if attempt == 0 {
+                    debug!("Failed to bind ephemeral port: {}", e);
+                }
+            }
+        }
+    }
+    Err(anyhow!("Failed to bind unique ephemeral port after multiple attempts"))
+}
 
 async fn send_conn_established(
     relay_writer: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -113,48 +154,35 @@ pub async fn establish_multi_connections(
         if tcp_connections > current_socket_count {
             let needed_more = (tcp_connections - current_socket_count) as usize;
             info!("Sender: Binding {} more sockets...", needed_more);
-            
-            let next_port = if let Some(last) = session.bound_sockets.last() {
-                last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
-            } else {
-                0
-            };
-            
-            if next_port > 0 {
-                let mut new_ports = Vec::new();
-                let mut added_count = 0;
-                let mut current_port = next_port;
-                let mut attempt_counter = 0;
-                
-                while added_count < needed_more && attempt_counter < 100 {
-                    match create_bound_socket(current_port) {
-                        Ok(s) => {
-                            session.bound_sockets.push(s);
-                            new_ports.push(current_port);
-                            added_count += 1;
-                            debug!("Bound extra socket on port {}", current_port);
-                        },
-                        Err(_) => {}
+            let mut new_ports = Vec::new();
+            for _ in 0..needed_more {
+                match bind_ephemeral_unique(&session.bound_sockets, None) {
+                    Ok((sock, new_port)) => {
+                        session.bound_sockets.push(sock);
+                        new_ports.push(new_port);
+                        debug!("Bound extra socket on port {}", new_port);
                     }
-                    current_port = current_port.wrapping_add(1);
-                    attempt_counter += 1;
+                    Err(e) => {
+                        warn!("Failed to bind extra socket: {}", e);
+                        break;
+                    }
                 }
+            }
+            
+            info!("Bound {} additional sockets (total: {})", new_ports.len(), session.bound_sockets.len());
+            
+            if !new_ports.is_empty() {
+                info!("Sender: Sending add_ports for {} new ports (Port-Preserved NAT)", new_ports.len());
                 
-                info!("Bound {} additional sockets (total: {})", added_count, session.bound_sockets.len());
+                let add_msg = AddPortsMessage::new(session_id, new_ports.clone());
+                let json = serde_json::to_string(&add_msg)? + "\n";
+                relay_writer.write_all(json.as_bytes()).await?;
+                relay_writer.flush().await?;
+                info!("Sent add_ports message");
                 
-                if !new_ports.is_empty() {
-                    info!("Sender: Sending add_ports for {} new ports (Port-Preserved NAT)", new_ports.len());
-                    
-                    let add_msg = AddPortsMessage::new(session_id, new_ports.clone());
-                    let json = serde_json::to_string(&add_msg)? + "\n";
-                    relay_writer.write_all(json.as_bytes()).await?;
-                    relay_writer.flush().await?;
-                    info!("Sent add_ports message");
-                    
-                    match wait_for_ports_ack_from_queue(&queues, &new_ports, Duration::from_secs(30)).await {
-                        Ok(_) => info!("New ports confirmed by server"),
-                        Err(e) => warn!("Failed to get ACK for new ports: {}", e),
-                    }
+                match wait_for_ports_ack_from_queue(&queues, &new_ports, Duration::from_secs(30)).await {
+                    Ok(_) => info!("New ports confirmed by server"),
+                    Err(e) => warn!("Failed to get ACK for new ports: {}", e),
                 }
             }
         }
@@ -166,51 +194,29 @@ pub async fn establish_multi_connections(
         let socket_index = conn_num as usize;
         
         if socket_index >= session.bound_sockets.len() {
-            let base_port = if let Some(last) = session.bound_sockets.last() {
-                last.local_addr().map(|a| a.as_socket().map(|s| s.port()).unwrap_or(0)).unwrap_or(0).wrapping_add(1)
-            } else {
-                let reason = "No initial socket available".to_string();
-                warn!("Abandoning connection {}: {}", conn_num + 1, reason);
-                let _ = send_conn_abandoned(&mut relay_writer, conn_num, &reason).await;
-                failures_in_a_row = 0;
-                continue;
+            let (new_socket, new_port) = match bind_ephemeral_unique(&session.bound_sockets, None) {
+                Ok(value) => value,
+                Err(e) => {
+                    let reason = format!("Failed to bind socket for connection {}: {}", conn_num + 1, e);
+                    warn!("Abandoning connection {}: {}", conn_num + 1, reason);
+                    let _ = send_conn_abandoned(&mut relay_writer, conn_num, &reason).await;
+                    failures_in_a_row = 0;
+                    continue;
+                }
             };
             
-            let mut bound = false;
-            for port_offset in 0u16..50 {
-                let try_port = base_port.wrapping_add(port_offset);
-                match create_bound_socket(try_port) {
-                    Ok(new_socket) => {
-                        let new_port = new_socket.local_addr()?.as_socket().map(|s| s.port()).unwrap_or(try_port);
-                        session.bound_sockets.push(new_socket);
-                        info!("On-demand: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
-                        
-                        let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
-                        let json = serde_json::to_string(&add_msg)? + "\n";
-                        relay_writer.write_all(json.as_bytes()).await?;
-                        relay_writer.flush().await?;
-                        info!("Sent add_ports for new socket {}", new_port);
-                        
-                        match wait_for_ports_ack_from_queue(&queues, &[new_port], Duration::from_secs(30)).await {
-                            Ok(_) => info!("New port {} confirmed by server", new_port),
-                            Err(e) => warn!("Failed to get ACK for new port {}: {}", new_port, e),
-                        }
-                        bound = true;
-                        break;
-                    }
-                    Err(e) => {
-                        if port_offset == 0 {
-                            debug!("Port {} unavailable: {}, trying next...", try_port, e);
-                        }
-                    }
-                }
-            }
-            if !bound {
-                let reason = format!("Failed to bind socket for connection {} (tried 50 ports from {})", conn_num + 1, base_port);
-                warn!("Abandoning connection {}: {}", conn_num + 1, reason);
-                let _ = send_conn_abandoned(&mut relay_writer, conn_num, &reason).await;
-                failures_in_a_row = 0;
-                continue;
+            session.bound_sockets.push(new_socket);
+            info!("On-demand: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
+            
+            let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
+            let json = serde_json::to_string(&add_msg)? + "\n";
+            relay_writer.write_all(json.as_bytes()).await?;
+            relay_writer.flush().await?;
+            info!("Sent add_ports for new socket {}", new_port);
+            
+            match wait_for_ports_ack_from_queue(&queues, &[new_port], Duration::from_secs(30)).await {
+                Ok(_) => info!("New port {} confirmed by server", new_port),
+                Err(e) => warn!("Failed to get ACK for new port {}: {}", new_port, e),
             }
         }
         
@@ -283,31 +289,24 @@ pub async fn establish_multi_connections(
                 ConnectionState::Punching { conn_num, ref peer_info, ref strategy, start_at } => {
                     debug!("State: Punching (conn {})", conn_num);
                     
-                    // 🔴 DEBUG: Force first connection 0 to fail for retry testing
-                    if conn_num == 0 && FIRST_CONN_0_ATTEMPT.swap(false, Ordering::Relaxed) {
-                        error!("🔴 [DEBUG] Forcing connection 0 to fail (first attempt only)");
-                        failures_in_a_row += 1;
-                        handle_connection_failure(state, "DEBUG: Forced failure for retry testing".to_string())?
-                    } else {
-                        match punch_connection_with_strategy(
-                            session.bound_sockets[socket_index].try_clone()?,
-                            peer_info,
-                            strategy,
-                            start_at,
-                            session.time_offset,
-                            timeout,
-                        ).await {
-                            Ok(stream) => {
-                                info!("Connection {}/{} established!", conn_num + 1, actual_tcp_connections);
-                                failures_in_a_row = 0;
-                                connection_stream = Some(stream);
-                                handle_connection_success(state)?
-                            }
-                            Err(e) => {
-                                error!("Connection {} failed: {}", conn_num + 1, e);
-                                failures_in_a_row += 1;
-                                handle_connection_failure(state, e.to_string())?
-                            }
+                    match punch_connection_with_strategy(
+                        session.bound_sockets[socket_index].try_clone()?,
+                        peer_info,
+                        strategy,
+                        start_at,
+                        session.time_offset,
+                        timeout,
+                    ).await {
+                        Ok(stream) => {
+                            info!("Connection {}/{} established!", conn_num + 1, actual_tcp_connections);
+                            failures_in_a_row = 0;
+                            connection_stream = Some(stream);
+                            handle_connection_success(state)?
+                        }
+                        Err(e) => {
+                            error!("Connection {} failed: {}", conn_num + 1, e);
+                            failures_in_a_row += 1;
+                            handle_connection_failure(state, e.to_string())?
                         }
                     }
                 }
@@ -351,54 +350,36 @@ pub async fn establish_multi_connections(
                     match wait_for_retry_granted_from_queue(&queues, conn_num, Duration::from_secs(60)).await {
                         Ok(()) => {
                             info!("Retry granted by server for connection {}", conn_num + 1);
-                            
-                            let base_port_opt = session
-                                .bound_sockets
-                                .last()
-                                .and_then(|last| last.local_addr().ok())
-                                .and_then(|a| a.as_socket().map(|s| s.port()))
-                                .map(|p| p.wrapping_add(1));
-                            
-                            if let Some(base_port) = base_port_opt {
-                                let mut retry_bound = false;
-                                for port_offset in 0u16..50 {
-                                    let try_port = base_port.wrapping_add(port_offset);
-                                    match create_bound_socket(try_port) {
-                                        Ok(new_socket) => {
-                                            let new_port = new_socket.local_addr()?.as_socket().map(|s| s.port()).unwrap_or(try_port);
-                                            
-                                            if socket_index < session.bound_sockets.len() {
-                                                session.bound_sockets[socket_index] = new_socket;
-                                            } else {
-                                                session.bound_sockets.push(new_socket);
-                                            }
-                                            
-                                            info!("Retry: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
-                                            
-                                            let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
-                                            let json = serde_json::to_string(&add_msg)? + "\n";
-                                            relay_writer.write_all(json.as_bytes()).await?;
-                                            relay_writer.flush().await?;
-                                            info!("Sent add_ports for retry socket {}", new_port);
-                                            
-                                            match wait_for_ports_ack_from_queue(&queues, &[new_port], Duration::from_secs(30)).await {
-                                                Ok(_) => info!("New port {} confirmed by server", new_port),
-                                                Err(e) => warn!("Failed to get ACK for new port {}: {}", new_port, e),
-                                            }
-                                            
-                                            retry_bound = true;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            if port_offset == 0 {
-                                                debug!("Retry: Port {} unavailable: {}, trying next...", try_port, e);
-                                            }
-                                        }
+                            let exclude_index = if socket_index < session.bound_sockets.len() {
+                                Some(socket_index)
+                            } else {
+                                None
+                            };
+                            match bind_ephemeral_unique(&session.bound_sockets, exclude_index) {
+                                Ok((new_socket, new_port)) => {
+                                    if socket_index < session.bound_sockets.len() {
+                                        session.bound_sockets[socket_index] = new_socket;
+                                    } else {
+                                        session.bound_sockets.push(new_socket);
                                     }
+                                    
+                                    info!("Retry: Bound new socket on port {} for connection {}", new_port, conn_num + 1);
+                                    
+                                    let add_msg = AddPortsMessage::new(session_id, vec![new_port]);
+                                    let json = serde_json::to_string(&add_msg)? + "\n";
+                                    relay_writer.write_all(json.as_bytes()).await?;
+                                    relay_writer.flush().await?;
+                                    info!("Sent add_ports for retry socket {}", new_port);
+                                    
+                                    match wait_for_ports_ack_from_queue(&queues, &[new_port], Duration::from_secs(30)).await {
+                                        Ok(_) => info!("New port {} confirmed by server", new_port),
+                                        Err(e) => warn!("Failed to get ACK for new port {}: {}", new_port, e),
+                                    }
+                                    
+                                    handle_retry_granted(state)?
                                 }
-                                
-                                if !retry_bound {
-                                    let reason = format!("Failed to bind socket for retry (tried 50 ports from {})", base_port);
+                                Err(e) => {
+                                    let reason = format!("Failed to bind socket for retry: {}", e);
                                     error!("{}", reason);
                                     abandon_reason = Some(reason.clone());
                                     ConnectionState::Failed {
@@ -406,16 +387,6 @@ pub async fn establish_multi_connections(
                                         reason,
                                         attempt: attempt + 1,
                                     }
-                                } else {
-                                    handle_retry_granted(state)?
-                                }
-                            } else {
-                                let reason = "No socket available for retry".to_string();
-                                abandon_reason = Some(reason.clone());
-                                ConnectionState::Failed {
-                                    conn_num,
-                                    reason,
-                                    attempt: attempt + 1,
                                 }
                             }
                         }
