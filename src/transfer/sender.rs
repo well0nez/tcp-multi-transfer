@@ -183,10 +183,7 @@ pub async fn run_multi_sender(
     sha256: [u8; 32],
 ) -> Result<()> {
     if streams.is_empty() { return Err(anyhow!("No streams")); }
-    
-    // Sort streams deterministically
-    streams.sort_by_key(|s| s.peer_addr().map(|a| a.port()).unwrap_or(0));
-    info!("Sorted {} streams by remote port", streams.len());
+    info!("Using {} streams in connection order", streams.len());
     
     let total_streams = streams.len();
     for (i, stream) in streams.iter_mut().enumerate() {

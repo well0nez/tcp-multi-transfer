@@ -224,9 +224,7 @@ async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
 
 pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
     if streams.is_empty() { return Err(anyhow!("No streams")); }
-    
-    streams.sort_by_key(|s| s.peer_addr().map(|a| a.port()).unwrap_or(0));
-    info!("Sorted {} streams by remote port", streams.len());
+    info!("Using {} streams in connection order", streams.len());
     
     // Handshake + FileInfo only on first stream (heavy protocol setup)
     let mut file_info: Option<FileInfoMessage> = None;
