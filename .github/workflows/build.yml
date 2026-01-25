@@ -45,7 +45,9 @@ jobs:
           mkdir -p dist
           cp target/release/tcp-multi-transfer dist/
           cp run_server.py dist/
+          cp -r server dist/
           cp README.md dist/
+          cp NOTES.md dist/
 
       - name: Prepare dist (windows)
         if: runner.os == 'Windows'
@@ -54,7 +56,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\tcp-multi-transfer.exe dist\
           Copy-Item run_server.py dist\
+          Copy-Item -Recurse server dist\
           Copy-Item README.md dist\
+          Copy-Item NOTES.md dist\
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

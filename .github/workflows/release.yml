@@ -51,7 +51,9 @@ jobs:
           mkdir -p dist
           cp target/release/tcp-multi-transfer dist/
           cp run_server.py dist/
+          cp -r server dist/
           cp README.md dist/
+          cp NOTES.md dist/ 2>/dev/null || true
 
       - name: Prepare dist (windows)
         if: runner.os == 'Windows'
@@ -60,7 +62,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\tcp-multi-transfer.exe dist\
           Copy-Item run_server.py dist\
+          Copy-Item -Recurse server dist\
           Copy-Item README.md dist\
+          if (Test-Path NOTES.md) { Copy-Item NOTES.md dist\ }
 
       - name: Create archive (unix)
         if: runner.os != 'Windows'
