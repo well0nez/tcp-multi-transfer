@@ -1,12 +1,49 @@
+# Rust build artifacts
 target/
+Cargo.lock
+
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+.eggs/
+
+# Logs
 *.log
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated
+.DS_Store
+Thumbs.db
+nul
+
+# Cache directories
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Test artifacts
+.coverage
+htmlcov/
+
+# Development files
 MULTI_TCP_PLAN.md
 src/connection_tests.rs
+count_lines.ps1
 
 # Backup directories
 copy/
 original/
+
+# Environment
+.env
+.venv/
+venv/

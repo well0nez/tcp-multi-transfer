@@ -213,23 +213,33 @@ impl TcpReceiver {
     }
 }
 
+/// PERF: SHA256 calculation moved to blocking thread to avoid blocking async runtime
 async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = vec![0u8; super::get_chunk_size()];
+    let path = path.to_path_buf();
+    let chunk_size = super::get_chunk_size();
     
-    loop {
-        let n = file.read(&mut buffer).await?;
-        if n == 0 {
-            break;
+    // Move CPU-intensive hashing to a blocking thread
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = vec![0u8; chunk_size];
+        
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
         }
-        hasher.update(&buffer[..n]);
-    }
-    
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    Ok(hash)
+        
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        Ok(hash)
+    })
+    .await
+    .map_err(|e| anyhow!("SHA256 task panicked: {}", e))?
 }
 
 pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
@@ -284,10 +294,24 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
     }
     
     let progress_bar = ProgressTracker::with_bytes(file_info.file_size, &file_info.filename, io_bytes.clone());
+    
+    // PERF: Event-based waiting instead of polling loop
     loop {
-        if done_received.load(Ordering::Relaxed) { break; }
-        if handles.iter().all(|h| h.is_finished()) { break; }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::select! {
+            _ = done_notify.notified() => {
+                if done_received.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            _ = async {
+                // Fallback: check if all handles finished (error cases)
+                while !handles.iter().all(|h| h.is_finished()) {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            } => {
+                break;
+            }
+        }
     }
     
     for handle in handles { let _ = handle.await; }

@@ -226,6 +226,7 @@ pub async fn run_multi_sender(
     let total_chunks = ((file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
     let pending = Arc::new(Mutex::new((0..total_chunks).collect::<VecDeque<_>>()));
     let notify = Arc::new(Notify::new());
+    let completion_notify = Arc::new(Notify::new()); // PERF: Event-based completion detection
     let completed_chunks = Arc::new(AtomicUsize::new(0));
     let completed_bytes = Arc::new(AtomicU64::new(0));
     let sent_bytes = Arc::new(AtomicU64::new(0));
@@ -241,15 +242,30 @@ pub async fn run_multi_sender(
         let completed_chunks = completed_chunks.clone();
         let completed_bytes = completed_bytes.clone();
         let sent_bytes = sent_bytes.clone();
+        let completion_notify = completion_notify.clone();
         handles.push(tokio::spawn(async move {
-            sender_worker(stream, file_path, file_size, pending, notify, completed_chunks, completed_bytes, sent_bytes, total_chunks, chunk_size).await
+            sender_worker(stream, file_path, file_size, pending, notify, completed_chunks, completed_bytes, sent_bytes, total_chunks, chunk_size, completion_notify).await
         }));
     }
     
+    // PERF: Event-based waiting instead of polling loop
+    // Wait for either: all chunks complete (via notify) or all workers finished
     loop {
-        if completed_chunks.load(Ordering::Relaxed) as u32 >= total_chunks { break; }
-        if handles.iter().all(|h| h.is_finished()) { break; }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::select! {
+            _ = completion_notify.notified() => {
+                if completed_chunks.load(Ordering::Relaxed) as u32 >= total_chunks {
+                    break;
+                }
+            }
+            _ = async {
+                // Check if all handles are finished (fallback for error cases)
+                while !handles.iter().all(|h| h.is_finished()) {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            } => {
+                break;
+            }
+        }
     }
     
     let mut returned_streams = Vec::new();
@@ -287,6 +303,7 @@ async fn sender_worker(
     sent_bytes: Arc<AtomicU64>,
     total_chunks: u32,
     chunk_size: usize,
+    completion_notify: Arc<Notify>,
 ) -> Result<TcpStream> {
     let mut file = File::open(&file_path).await?;
     let mut buffer = vec![0u8; chunk_size];
@@ -332,6 +349,7 @@ async fn sender_worker(
                 completed_bytes.fetch_add(len as u64, Ordering::Relaxed);
                 if completed_chunks.load(Ordering::Relaxed) as u32 >= total_chunks {
                     notify.notify_waiters();
+                    completion_notify.notify_waiters(); // PERF: Signal main loop
                 }
             }
             Err(_) => {

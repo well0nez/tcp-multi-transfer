@@ -34,6 +34,9 @@ pub struct Session {
     // Server connection info (for probing new ports)
     pub server_addr: SocketAddr,
     pub probe_port: Option<u16>,
+    
+    // PERF: RTT measurement for adaptive GO delay
+    pub measured_rtt: f64,
 }
 
 pub fn parse_host_port(input: &str) -> Result<(String, u16)> {
@@ -180,6 +183,7 @@ pub async fn run_relay_protocol(
         peer_extra_ports: vec![],
         server_addr: server_sock_addr,
         probe_port: None,
+        measured_rtt: 0.0,
     };
     
     loop {
@@ -202,14 +206,38 @@ pub async fn run_relay_protocol(
                     info!("Registered! Public address: {}:{}", ip, port);
                     
                     if let Some(times) = server_times {
-                        // Collect offsets from all timestamp samples
+                        // BUG-006 FIX: Improved time sync with RTT estimation
+                        // The server sends timestamps taken 50ms apart. We received all of them
+                        // at once, so we need to account for the network delay.
+                        
+                        let receive_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs_f64();
+                        
+                        // Estimate one-way delay as half the RTT
+                        let rtt = receive_time - register_sent_at;
+                        let one_way_delay = rtt / 2.0;
+                        
+                        // Use the LAST server timestamp (most recent) and adjust for one-way delay
+                        // The last timestamp was taken just before sending the response
                         let mut offsets = Vec::new();
-                        for srv_time in times {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs_f64();
-                            let offset = srv_time - now;
+                        if let Some(&last_srv_time) = times.last() {
+                            // Offset = server_time - (our_time_when_server_took_timestamp)
+                            // our_time_when_server_took_timestamp ≈ receive_time - one_way_delay
+                            let our_estimated_time = receive_time - one_way_delay;
+                            let offset = last_srv_time - our_estimated_time;
+                            offsets.push(offset);
+                        }
+                        
+                        // Also compute offsets for each sample for statistics
+                        // Server samples are 50ms apart, we received them at receive_time
+                        let num_samples = times.len();
+                        for (i, srv_time) in times.iter().enumerate() {
+                            // Each earlier sample was taken (num_samples - 1 - i) * 50ms before the last one
+                            let sample_age_offset = ((num_samples - 1 - i) as f64) * 0.05;
+                            let our_estimated_time = receive_time - one_way_delay - sample_age_offset;
+                            let offset = srv_time - our_estimated_time;
                             offsets.push(offset);
                         }
                         
@@ -217,8 +245,12 @@ pub async fn run_relay_protocol(
                         offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         session.time_offset = offsets[offsets.len() / 2];
                         
-                        info!("Clock offset (median of {} samples): {:.3}s", offsets.len(), session.time_offset);
-                        info!("   Range: {:.3}s to {:.3}s (spread: {:.3}s)", 
+                        // PERF: Store RTT for adaptive GO delay
+                        session.measured_rtt = rtt;
+                        
+                        info!("Clock offset (median of {} samples): {:.3}s (RTT: {:.3}s)", 
+                              offsets.len(), session.time_offset, rtt);
+                        debug!("   Offset range: {:.3}s to {:.3}s (spread: {:.3}s)", 
                               offsets.first().unwrap_or(&0.0),
                               offsets.last().unwrap_or(&0.0),
                               offsets.last().unwrap_or(&0.0) - offsets.first().unwrap_or(&0.0));
@@ -230,6 +262,7 @@ pub async fn run_relay_protocol(
                             .as_secs_f64();
                         let rtt = now - register_sent_at;
                         session.time_offset = srv_time - (register_sent_at + rtt / 2.0);
+                        session.measured_rtt = rtt;  // PERF: Store RTT
                         warn!("Using legacy RTT/2 time sync (offset: {:.3}s) - server should send server_times array", session.time_offset);
                     } else {
                         warn!("No time sync data received from server - synchronization may be inaccurate");

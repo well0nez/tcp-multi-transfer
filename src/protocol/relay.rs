@@ -164,7 +164,7 @@ pub struct NATAnalysis {
     #[serde(default)]
     #[allow(dead_code)]
     pub needs_scan: bool,
-    
+
     // Ignore all other fields sent by server (predicted_port, error_range, delta_median, etc.)
     // This keeps the data available if we change our mind later
     #[serde(flatten)]
@@ -189,7 +189,7 @@ pub enum RelayMessage {
         #[serde(default)]
         server_times: Option<Vec<f64>>,
     },
-    
+
     #[serde(rename = "peer_info")]
     PeerInfo {
         peer_public_addr: Vec<serde_json::Value>,
@@ -210,19 +210,15 @@ pub enum RelayMessage {
         #[serde(default)]
         connection_num: Option<u32>,
         #[serde(default)]
-        punch_strategy: Option<String>,  // "listen" | "connect" | "scan"
+        punch_strategy: Option<String>, // "listen" | "connect" | "scan"
     },
-    
+
     #[serde(rename = "peer_added_ports")]
-    PeerAddedPorts {
-        ports: Vec<u16>,
-    },
-    
+    PeerAddedPorts { ports: Vec<u16> },
+
     #[serde(rename = "ports_added_ack")]
-    PortsAddedAck {
-        ports: Vec<u16>,
-    },
-    
+    PortsAddedAck { ports: Vec<u16> },
+
     #[serde(rename = "go")]
     Go {
         start_at: f64,
@@ -232,44 +228,44 @@ pub enum RelayMessage {
         #[serde(default)]
         connection_num: Option<u32>,
     },
-    
+
     /// Retry Request: Client will Connection erneut versuchen
     #[serde(rename = "retry_request")]
     RetryRequest {
         #[allow(dead_code)]
         connection_num: u32,
     },
-    
+
     /// Retry Granted: Server erlaubt Retry (beide Peers wollen)
     #[serde(rename = "retry_granted")]
-    RetryGranted {
-        connection_num: u32,
-    },
-    
+    RetryGranted { connection_num: u32 },
+
     /// Retry Rejected: Server lehnt Retry ab (Peer fehlt oder Timeout)
     #[serde(rename = "retry_rejected")]
-    RetryRejected {
-        connection_num: u32,
-        reason: String,
-    },
-    
+    RetryRejected { connection_num: u32, reason: String },
+
     #[serde(rename = "ping")]
     Ping {},
-    
+
     #[serde(rename = "keepalive_ack")]
     KeepaliveAck {},
-    
+
     #[serde(rename = "error")]
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 impl RelayMessage {
     pub fn parse_addr(addr: &[serde_json::Value]) -> Option<(String, u16)> {
-        if addr.len() != 2 { return None; }
+        if addr.len() != 2 {
+            return None;
+        }
         let ip = addr[0].as_str()?.to_string();
-        let port = addr[1].as_u64()? as u16;
+        let port_u64 = addr[1].as_u64()?;
+        // BUG-010 FIX: Validate port range before truncation
+        if port_u64 > 65535 {
+            return None;
+        }
+        let port = port_u64 as u16;
         Some((ip, port))
     }
 }

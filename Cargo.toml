@@ -1,6 +1,6 @@
 [package]
 name = "tcp-multi-transfer"
-version = "0.9.3"
+version = "0.9.3-beta.1"
 edition = "2021"
 authors = ["TCP Transfer Team"]
 description = "Multi-TCP file transfer with NAT traversal (hole punching)"

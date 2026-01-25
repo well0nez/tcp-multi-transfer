@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::{TcpListener, TcpStream};
 use anyhow::{Result, anyhow};
 use tracing::{info, debug, warn};
@@ -179,10 +181,18 @@ async fn punch_scan(
     let channel_capacity = peer_addresses.len().saturating_add(2).max(4);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TcpStream>(channel_capacity);
     
+    // BUG-003 FIX: Shared shutdown flag for clean task termination
+    let shutdown = Arc::new(AtomicBool::new(false));
+    
     // Listener Task
     let listener_tx = tx.clone();
+    let listener_shutdown = shutdown.clone();
     let listener_handle = tokio::spawn(async move {
         loop {
+            if listener_shutdown.load(Ordering::Relaxed) {
+                debug!("SCAN: Listener shutting down");
+                break;
+            }
             match listener.accept().await {
                 Ok((mut stream, peer_addr)) => {
                     debug!("SCAN: Accepted from {}", peer_addr);
@@ -205,12 +215,19 @@ async fn punch_scan(
     let connector_handles: Vec<_> = peer_addresses.into_iter().enumerate().map(|(idx, peer_addr)| {
         let connector_tx = tx.clone();
         let timeout = timeout;
+        let connector_shutdown = shutdown.clone();
         
         tokio::spawn(async move {
             let start = tokio::time::Instant::now();
             let mut attempt = 0;
             
             while start.elapsed() < timeout {
+                // BUG-003 FIX: Check shutdown flag
+                if connector_shutdown.load(Ordering::Relaxed) {
+                    debug!("SCAN[{}]: Connector shutting down", idx);
+                    return;
+                }
+                
                 attempt += 1;
                 
                 // Erstelle neuen Socket für diesen Versuch
@@ -309,6 +326,8 @@ async fn punch_scan(
             Candidate { stream, local_port, remote_port }
         }
         Ok(None) => {
+            // BUG-003 FIX: Signal shutdown before aborting
+            shutdown.store(true, Ordering::Relaxed);
             listener_handle.abort();
             for h in connector_handles {
                 h.abort();
@@ -316,6 +335,8 @@ async fn punch_scan(
             return Err(anyhow!("SCAN timeout - no candidates"));
         }
         Err(_) => {
+            // BUG-003 FIX: Signal shutdown before aborting
+            shutdown.store(true, Ordering::Relaxed);
             listener_handle.abort();
             for h in connector_handles {
                 h.abort();
@@ -352,7 +373,8 @@ async fn punch_scan(
         }
     }
     
-    // Cleanup
+    // BUG-003 FIX: Signal shutdown and cleanup all tasks
+    shutdown.store(true, Ordering::Relaxed);
     listener_handle.abort();
     for h in connector_handles {
         h.abort();

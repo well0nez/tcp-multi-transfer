@@ -158,23 +158,33 @@ pub async fn calculate_sha256(file_path: &str) -> Result<([u8; 32], u64)> {
     Ok((hash, file_size))
 }
 
+/// PERF: SHA256 calculation moved to blocking thread to avoid blocking async runtime
 async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
-    let mut file = File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; super::get_chunk_size()];
+    let path = path.to_path_buf();
+    let chunk_size = super::get_chunk_size();
     
-    loop {
-        let n = file.read(&mut buffer).await?;
-        if n == 0 {
-            break;
+    // Move CPU-intensive hashing to a blocking thread
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; chunk_size];
+        
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
         }
-        hasher.update(&buffer[..n]);
-    }
-    
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    Ok(hash)
+        
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        Ok(hash)
+    })
+    .await
+    .map_err(|e| anyhow!("SHA256 task panicked: {}", e))?
 }
 
 /// Convert SHA256 hash to hex string
@@ -194,6 +204,18 @@ pub fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
         let socket = unsafe { Socket::from_raw_fd(fd) };
         let _ = socket.set_send_buffer_size(TCP_BUFFER_SIZE);
         let _ = socket.set_recv_buffer_size(TCP_BUFFER_SIZE);
+        
+        // BUG-005 FIX: Enable TCP keepalive for half-open connection detection
+        // Start keepalive after 30s idle, probe every 10s, fail after 3 probes (~60s total)
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10));
+        if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+            tracing::debug!("Failed to set TCP keepalive: {}", e);
+        } else {
+            tracing::debug!("TCP keepalive enabled (30s idle, 10s interval)");
+        }
+        
         let actual_send = socket.send_buffer_size().unwrap_or(0);
         let actual_recv = socket.recv_buffer_size().unwrap_or(0);
         tracing::info!("TCP buffers: send={}MB recv={}MB (requested {}MB)", 
@@ -210,6 +232,18 @@ pub fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
         let socket = unsafe { Socket::from_raw_socket(raw) };
         let _ = socket.set_send_buffer_size(TCP_BUFFER_SIZE);
         let _ = socket.set_recv_buffer_size(TCP_BUFFER_SIZE);
+        
+        // BUG-005 FIX: Enable TCP keepalive for half-open connection detection
+        // Windows uses different API but socket2 abstracts it
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10));
+        if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+            tracing::debug!("Failed to set TCP keepalive: {}", e);
+        } else {
+            tracing::debug!("TCP keepalive enabled (30s idle, 10s interval)");
+        }
+        
         let actual_send = socket.send_buffer_size().unwrap_or(0);
         let actual_recv = socket.recv_buffer_size().unwrap_or(0);
         tracing::info!("TCP buffers: send={}MB recv={}MB (requested {}MB)", 

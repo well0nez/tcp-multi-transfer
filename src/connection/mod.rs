@@ -225,6 +225,8 @@ pub async fn establish_multi_connections(
         let mut state = ConnectionState::WaitingForPeerInfo { conn_num };
         let mut connection_stream: Option<TcpStream> = None;
         let mut abandon_reason: Option<String> = None;
+        // BUG-004 FIX: Track if we've already sent the result message to prevent double-send
+        let mut result_message_sent = false;
         
         loop {
             state = match state {
@@ -261,10 +263,14 @@ pub async fn establish_multi_connections(
                 ConnectionState::WaitingForGO { conn_num, peer_info: _, strategy: _ } => {
                     debug!("State: WaitingForGO (conn {})", conn_num);
                     
-                    let ready_msg = format!(r#"{{"type":"ready","connection_num":{}}}"#, conn_num) + "\n";
+                    // PERF: Include measured RTT for adaptive GO delay on server
+                    let ready_msg = format!(
+                        r#"{{"type":"ready","connection_num":{},"measured_rtt":{:.6}}}"#,
+                        conn_num, session.measured_rtt
+                    ) + "\n";
                     relay_writer.write_all(ready_msg.as_bytes()).await?;
                     relay_writer.flush().await?;
-                    info!("READY sent for connection {}", conn_num + 1);
+                    info!("READY sent for connection {} (RTT: {:.3}s)", conn_num + 1, session.measured_rtt);
                     
                     match wait_for_go_from_queue(&queues, conn_num, Duration::from_secs(120)).await {
                         Ok(go_signal) => {
@@ -313,8 +319,12 @@ pub async fn establish_multi_connections(
                 
                 ConnectionState::Established { conn_num } => {
                     debug!("State: Established (conn {}) - TERMINAL", conn_num);
-                    if let Err(e) = send_conn_established(&mut relay_writer, conn_num).await {
-                        warn!("Failed to notify server of connection {} establishment: {}", conn_num + 1, e);
+                    // BUG-004 FIX: Only send result message once
+                    if !result_message_sent {
+                        result_message_sent = true;
+                        if let Err(e) = send_conn_established(&mut relay_writer, conn_num).await {
+                            warn!("Failed to notify server of connection {} establishment: {}", conn_num + 1, e);
+                        }
                     }
                     if let Some(stream) = connection_stream {
                         streams.push(stream);
@@ -418,8 +428,12 @@ pub async fn establish_multi_connections(
         }
         
         if let Some(reason) = abandon_reason.take() {
-            warn!("Abandoning connection {}: {}", conn_num + 1, reason);
-            let _ = send_conn_abandoned(&mut relay_writer, conn_num, &reason).await;
+            // BUG-004 FIX: Only send result message once
+            if !result_message_sent {
+                result_message_sent = true;
+                warn!("Abandoning connection {}: {}", conn_num + 1, reason);
+                let _ = send_conn_abandoned(&mut relay_writer, conn_num, &reason).await;
+            }
             failures_in_a_row = 0;
             continue;
         }

@@ -1,9 +1,10 @@
 """
 Session and Peer Management
 """
+
 import asyncio
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 from .models import Peer
 
 logger = logging.getLogger(__name__)
@@ -14,19 +15,19 @@ MAX_PORT = 65535
 
 class SessionManager:
     """Manages sessions and peer connections"""
-    
+
     def __init__(self):
-        self.sessions: Dict[str, Dict[str, Peer]] = {}
+        self.sessions: Dict[str, Dict[str, Any]] = {}  # Contains Peer, bool, dict etc.
         self.session_locks: Dict[str, asyncio.Lock] = {}
         self.pending_probes: Dict[str, List[tuple]] = {}
         self.peer_info_sent: Dict[str, bool] = {}
-    
+
     def get_session_lock(self, session_id: str) -> asyncio.Lock:
         """Get or create lock for session"""
         if session_id not in self.session_locks:
             self.session_locks[session_id] = asyncio.Lock()
         return self.session_locks[session_id]
-    
+
     def parse_local_ports(self, local_ports_raw, fallback_port: int) -> List[int]:
         """Parse and validate local ports list"""
         ports: List[int] = []
@@ -53,7 +54,7 @@ class SessionManager:
             ordered = [fallback_port]
 
         return ordered
-    
+
     async def cleanup_peer(self, session_id: str, peer: Peer):
         """Clean up peer from session"""
         lock = self.get_session_lock(session_id)
@@ -66,7 +67,7 @@ class SessionManager:
             if peer.role in session and session[peer.role] is peer:
                 del session[peer.role]
 
-            other_role = 'sender' if peer.role == 'receiver' else 'receiver'
+            other_role = "sender" if peer.role == "receiver" else "receiver"
             other_peer = session.get(other_role)
             if other_peer:
                 del session[other_role]
@@ -82,7 +83,10 @@ class SessionManager:
             )
             try:
                 if not other_peer.writer.is_closing():
+                    # BUG-007 FIX: Flush pending data before closing
+                    await other_peer.writer.drain()
                     other_peer.writer.close()
                 await other_peer.writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as e:
+                # BUG-008 FIX: Log exception instead of silently ignoring
+                logger.debug(f"Error closing peer {other_peer.role} connection: {e}")

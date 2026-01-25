@@ -10,6 +10,8 @@
 //! - CRC32 per chunk during transfer with ACK/NACK
 //! - Pipelined I/O - Disk reads and network writes run in parallel!
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 mod helpers;
 mod sender;
 mod receiver;
@@ -22,17 +24,15 @@ pub use receiver::{TcpReceiver, run_multi_receiver};
 /// Default chunk size for reading/writing (8MB) - fewer syscalls
 pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-/// Global chunk size (set from main.rs)
-static mut CHUNK_SIZE: usize = DEFAULT_CHUNK_SIZE;
+/// BUG-009 FIX: Use AtomicUsize instead of unsafe static mut
+static CHUNK_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_CHUNK_SIZE);
 
 /// Set the chunk size (called from main.rs)
 pub fn set_chunk_size(size: usize) {
-    unsafe {
-        CHUNK_SIZE = size;
-    }
+    CHUNK_SIZE.store(size, Ordering::Relaxed);
 }
 
 /// Get the current chunk size
 pub(crate) fn get_chunk_size() -> usize {
-    unsafe { CHUNK_SIZE }
+    CHUNK_SIZE.load(Ordering::Relaxed)
 }

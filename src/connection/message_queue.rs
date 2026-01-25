@@ -1,10 +1,13 @@
 //! Thread-safe message queues preventing race conditions and message loss
 
-use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
-use crate::punch::PeerInfo;
 use super::types::GoSignal;
+use crate::punch::PeerInfo;
+
+/// BUG-002 FIX: Maximum queue size to prevent memory exhaustion
+const MAX_QUEUE_SIZE: usize = 100;
 
 /// Thread-safe queues for all incoming relay messages
 #[derive(Clone)]
@@ -32,13 +35,24 @@ impl MessageQueues {
             shutdown: Arc::new(Mutex::new(false)),
         }
     }
-    
-    pub fn push_peer_info(&self, conn_num: u32, info: PeerInfo, strategy: String, tcp_connections: u32) {
+
+    pub fn push_peer_info(
+        &self,
+        conn_num: u32,
+        info: PeerInfo,
+        strategy: String,
+        tcp_connections: u32,
+    ) {
         if let Ok(mut queue) = self.peer_infos.lock() {
+            // BUG-002 FIX: Enforce queue size limit
+            if queue.len() >= MAX_QUEUE_SIZE {
+                tracing::warn!("peer_infos queue full, dropping oldest entry");
+                queue.pop_front();
+            }
             queue.push_back((conn_num, info, strategy, tcp_connections));
         }
     }
-    
+
     pub fn pop_peer_info(&self, conn_num: u32) -> Option<(PeerInfo, String, u32)> {
         if let Ok(mut queue) = self.peer_infos.lock() {
             if let Some(pos) = queue.iter().position(|(num, _, _, _)| *num == conn_num) {
@@ -49,13 +63,18 @@ impl MessageQueues {
         }
         None
     }
-    
+
     pub fn push_go(&self, conn_num: u32, signal: GoSignal) {
         if let Ok(mut queue) = self.go_signals.lock() {
+            // BUG-002 FIX: Enforce queue size limit
+            if queue.len() >= MAX_QUEUE_SIZE {
+                tracing::warn!("go_signals queue full, dropping oldest entry");
+                queue.pop_front();
+            }
             queue.push_back((conn_num, signal));
         }
     }
-    
+
     pub fn pop_go(&self, conn_num: u32) -> Option<GoSignal> {
         if let Ok(mut queue) = self.go_signals.lock() {
             if let Some(pos) = queue.iter().position(|(num, _)| *num == conn_num) {
@@ -66,13 +85,18 @@ impl MessageQueues {
         }
         None
     }
-    
+
     pub fn push_ports_ack(&self, ports: Vec<u16>) {
         if let Ok(mut queue) = self.ports_acks.lock() {
+            // BUG-002 FIX: Enforce queue size limit
+            if queue.len() >= MAX_QUEUE_SIZE {
+                tracing::warn!("ports_acks queue full, dropping oldest entry");
+                queue.pop_front();
+            }
             queue.push_back(ports);
         }
     }
-    
+
     pub fn pop_ports_ack(&self) -> Option<Vec<u16>> {
         if let Ok(mut queue) = self.ports_acks.lock() {
             queue.pop_front()
@@ -80,13 +104,18 @@ impl MessageQueues {
             None
         }
     }
-    
+
     pub fn push_peer_added_ports(&self, ports: Vec<u16>) {
         if let Ok(mut queue) = self.peer_added_ports.lock() {
+            // BUG-002 FIX: Enforce queue size limit
+            if queue.len() >= MAX_QUEUE_SIZE {
+                tracing::warn!("peer_added_ports queue full, dropping oldest entry");
+                queue.pop_front();
+            }
             queue.push_back(ports);
         }
     }
-    
+
     /// Non-consuming read for notification handler
     pub fn get_peer_added_ports(&self) -> Vec<u16> {
         if let Ok(queue) = self.peer_added_ports.lock() {
@@ -95,13 +124,18 @@ impl MessageQueues {
             Vec::new()
         }
     }
-    
+
     pub fn push_retry_granted(&self, conn_num: u32) {
         if let Ok(mut queue) = self.retry_granted.lock() {
+            // BUG-002 FIX: Enforce queue size limit
+            if queue.len() >= MAX_QUEUE_SIZE {
+                tracing::warn!("retry_granted queue full, dropping oldest entry");
+                queue.pop_front();
+            }
             queue.push_back(conn_num);
         }
     }
-    
+
     pub fn pop_retry_granted(&self, conn_num: u32) -> Option<u32> {
         if let Ok(mut queue) = self.retry_granted.lock() {
             if let Some(pos) = queue.iter().position(|num| *num == conn_num) {
@@ -113,13 +147,18 @@ impl MessageQueues {
             None
         }
     }
-    
+
     pub fn push_retry_rejected(&self, conn_num: u32, reason: String) {
         if let Ok(mut queue) = self.retry_rejected.lock() {
+            // BUG-002 FIX: Enforce queue size limit
+            if queue.len() >= MAX_QUEUE_SIZE {
+                tracing::warn!("retry_rejected queue full, dropping oldest entry");
+                queue.pop_front();
+            }
             queue.push_back((conn_num, reason));
         }
     }
-    
+
     pub fn pop_retry_rejected(&self, conn_num: u32) -> Option<String> {
         if let Ok(mut queue) = self.retry_rejected.lock() {
             if let Some(pos) = queue.iter().position(|(num, _)| *num == conn_num) {
@@ -130,13 +169,18 @@ impl MessageQueues {
         }
         None
     }
-    
+
     pub fn push_error(&self, error: String) {
         if let Ok(mut queue) = self.errors.lock() {
+            // BUG-002 FIX: Enforce queue size limit
+            if queue.len() >= MAX_QUEUE_SIZE {
+                tracing::warn!("errors queue full, dropping oldest entry");
+                queue.pop_front();
+            }
             queue.push_back(error);
         }
     }
-    
+
     /// Non-consuming error check
     pub fn has_error(&self) -> Option<String> {
         if let Ok(queue) = self.errors.lock() {
@@ -145,13 +189,13 @@ impl MessageQueues {
             None
         }
     }
-    
+
     pub fn set_shutdown(&self) {
         if let Ok(mut flag) = self.shutdown.lock() {
             *flag = true;
         }
     }
-    
+
     pub fn is_shutdown(&self) -> bool {
         if let Ok(flag) = self.shutdown.lock() {
             *flag
