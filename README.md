@@ -238,7 +238,7 @@ Use `--debug` for detailed logging.
 
 ### Connection timeout
 
-Increase the timeout: `--timeout 60`
+The default timeout is 15 seconds. Increase if needed: `--timeout 30`
 
 ## References
 

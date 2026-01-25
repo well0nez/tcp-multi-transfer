@@ -2,8 +2,8 @@
 //!
 //! CLI argument parsing and configuration
 
+use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
-use anyhow::{Result, anyhow};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_NAT_PROBE_COUNT: u32 = 10;
@@ -38,21 +38,21 @@ pub struct Args {
     /// Relay server address (host:port)
     #[arg(short, long)]
     pub server: String,
-    
+
     /// Session ID (both sender and receiver must use the same ID)
     #[arg(short = 'i', long)]
     pub session_id: String,
-    
+
     /// Mode: send or receive
     #[arg(short, long, value_enum)]
     pub mode: Mode,
-    
+
     /// File to send (sender mode only)
     #[arg(short, long)]
     pub file: Option<String>,
-    
+
     /// Hole punch timeout in seconds
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "15")]
     pub timeout: u64,
 
     /// Number of NAT probes to send
@@ -70,11 +70,11 @@ pub struct Args {
     /// Expand prediction scan range by percentage
     #[arg(long, default_value_t = 0.0)]
     pub prediction_range_extra_pct: f64,
-    
+
     /// Number of parallel TCP connections (multi TCP)
     #[arg(long, default_value_t = 1, help_heading = "Multi-TCP")]
     pub tcp_connections: u8,
-    
+
     /// Maximum number of sequential punch attempts
     #[arg(long, default_value_t = 20, help_heading = "Multi-TCP")]
     pub max_attempts: u32,
@@ -86,11 +86,11 @@ pub struct Args {
     /// Minimum number of connections required (if fallback allowed)
     #[arg(long, default_value_t = 1, help_heading = "Multi-TCP")]
     pub min_connections: u32,
-    
+
     /// Enable debug logging
     #[arg(long)]
     pub debug: bool,
-    
+
     /// Chunk size for transfer (e.g., 512KB, 1MB, 2MB)
     #[arg(long, default_value = "8MB")]
     pub chunk: String,
@@ -99,15 +99,28 @@ pub struct Args {
 pub fn parse_chunk_size(s: &str) -> Result<usize> {
     let s = s.trim().to_uppercase();
     if s.ends_with("MB") {
-        let num: f64 = s.trim_end_matches("MB").trim().parse().map_err(|_| anyhow!("Invalid chunk size"))?;
+        let num: f64 = s
+            .trim_end_matches("MB")
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid chunk size"))?;
         Ok((num * 1024.0 * 1024.0) as usize)
     } else if s.ends_with("KB") {
-        let num: f64 = s.trim_end_matches("KB").trim().parse().map_err(|_| anyhow!("Invalid chunk size"))?;
+        let num: f64 = s
+            .trim_end_matches("KB")
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid chunk size"))?;
         Ok((num * 1024.0) as usize)
     } else if s.ends_with("B") {
-        let num: usize = s.trim_end_matches("B").trim().parse().map_err(|_| anyhow!("Invalid chunk size"))?;
+        let num: usize = s
+            .trim_end_matches("B")
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid chunk size"))?;
         Ok(num)
     } else {
-        s.parse::<usize>().map_err(|_| anyhow!("Invalid chunk size"))
+        s.parse::<usize>()
+            .map_err(|_| anyhow!("Invalid chunk size"))
     }
 }
