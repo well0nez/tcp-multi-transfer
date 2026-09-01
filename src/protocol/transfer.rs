@@ -10,7 +10,6 @@ pub enum MessageType {
     Hello = 1,
     FileInfo = 2,
     FileInfoAck = 3,
-    Data = 4,
     Done = 5,
     Ack = 6,
     StreamInfo = 8,
@@ -18,8 +17,6 @@ pub enum MessageType {
     ChunkAck = 10,
     ChunkHeader = 13,
     ChunkNack = 15,
-    TransferDone = 16,
-    TransferDoneAck = 17,
 }
 
 impl MessageType {
@@ -28,7 +25,6 @@ impl MessageType {
             1 => Some(Self::Hello),
             2 => Some(Self::FileInfo),
             3 => Some(Self::FileInfoAck),
-            4 => Some(Self::Data),
             5 => Some(Self::Done),
             6 => Some(Self::Ack),
             8 => Some(Self::StreamInfo),
@@ -36,8 +32,6 @@ impl MessageType {
             10 => Some(Self::ChunkAck),
             13 => Some(Self::ChunkHeader),
             15 => Some(Self::ChunkNack),
-            16 => Some(Self::TransferDone),
-            17 => Some(Self::TransferDoneAck),
             _ => None,
         }
     }
@@ -71,22 +65,32 @@ impl HelloMessage {
 pub struct StreamInfoMessage {
     pub stream_index: u32,
     pub total_streams: u32,
+    /// Blockgroesse in Bytes, vom Sender festgelegt.
+    ///
+    /// Frueher rechnete jede Seite sie selbst aus Dateigroesse und Stromzahl
+    /// aus. Das stimmt nur ueberein, solange beide Seiten dasselbe `--chunk`
+    /// gesetzt haben — sonst zerfaellt die Datei fuer den Sender in eine
+    /// andere Zahl von Bloecken als fuer den Empfaenger, und die Zuordnung
+    /// bricht. Es gibt jetzt genau eine Instanz, die entscheidet.
+    pub chunk_size: u32,
 }
 
 impl StreamInfoMessage {
     pub fn encode(&self) -> BytesMut {
-        let mut buf = BytesMut::with_capacity(9);
+        let mut buf = BytesMut::with_capacity(13);
         buf.put_u8(MessageType::StreamInfo as u8);
         buf.put_u32(self.stream_index);
         buf.put_u32(self.total_streams);
+        buf.put_u32(self.chunk_size);
         buf
     }
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < 9 { return None; }
+        if data.len() < 13 { return None; }
         let mut cursor = &data[1..];
         let stream_index = cursor.get_u32();
         let total_streams = cursor.get_u32();
-        Some(Self { stream_index, total_streams })
+        let chunk_size = cursor.get_u32();
+        Some(Self { stream_index, total_streams, chunk_size })
     }
 }
 
@@ -160,18 +164,6 @@ impl FileInfoMessage {
         buf.put_slice(name_bytes);
         buf.put_slice(&self.sha256);
         buf
-    }
-    #[allow(dead_code)]
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < 13 { return None; }
-        let mut cursor = &data[1..];
-        let name_len = cursor.get_u32() as usize;
-        let file_size = cursor.get_u64();
-        if data.len() < 13 + name_len + 32 { return None; }
-        let filename = String::from_utf8(data[13..13+name_len].to_vec()).ok()?;
-        let mut sha256 = [0u8; 32];
-        sha256.copy_from_slice(&data[13+name_len..13+name_len+32]);
-        Some(Self { filename, file_size, sha256 })
     }
 }
 

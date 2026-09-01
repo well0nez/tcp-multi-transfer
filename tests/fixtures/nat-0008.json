@@ -1,0 +1,102 @@
+{
+  "expected": {
+    "delta_max": -29822,
+    "delta_median": -29966.5,
+    "delta_min": -30046,
+    "delta_stdev": 71.39894957210505,
+    "error_range": 288,
+    "local_ports": [
+      35127,
+      35128,
+      35129,
+      35130,
+      35127,
+      35128,
+      35129,
+      35130,
+      35127,
+      35128
+    ],
+    "max_port": 5307,
+    "min_port": 5081,
+    "needs_scan": true,
+    "pattern_type": "random_like",
+    "port_range": 226,
+    "port_rate": 0.0,
+    "predicted_port": 5160,
+    "predicted_shift": 0,
+    "prediction_delay": 2.0,
+    "prediction_source": "extrapoliert",
+    "probed_ports": [
+      5081,
+      5137,
+      5307,
+      5164,
+      5119,
+      5292,
+      5203,
+      5244,
+      5160,
+      5129
+    ],
+    "scan_end": 5307,
+    "scan_start": 5081
+  },
+  "input": {
+    "prediction_mode": "delta",
+    "prediction_range_extra_pct": 0.0,
+    "probes": [
+      {
+        "local_port": 35127,
+        "nat_port": 5081,
+        "ts": 1788139983.6668572
+      },
+      {
+        "local_port": 35128,
+        "nat_port": 5137,
+        "ts": 1788139983.749188
+      },
+      {
+        "local_port": 35129,
+        "nat_port": 5307,
+        "ts": 1788139983.831603
+      },
+      {
+        "local_port": 35130,
+        "nat_port": 5164,
+        "ts": 1788139983.9116309
+      },
+      {
+        "local_port": 35127,
+        "nat_port": 5119,
+        "ts": 1788139984.9964862
+      },
+      {
+        "local_port": 35128,
+        "nat_port": 5292,
+        "ts": 1788139986.1140187
+      },
+      {
+        "local_port": 35129,
+        "nat_port": 5203,
+        "ts": 1788139986.1966066
+      },
+      {
+        "local_port": 35130,
+        "nat_port": 5244,
+        "ts": 1788139986.2717614
+      },
+      {
+        "local_port": 35127,
+        "nat_port": 5160,
+        "ts": 1788139987.381626
+      },
+      {
+        "local_port": 35128,
+        "nat_port": 5129,
+        "ts": 1788139987.4739676
+      }
+    ],
+    "target_local_port": 35127
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "expected": {
+    "delta_max": -33083,
+    "delta_median": -33162,
+    "delta_min": -33269,
+    "delta_stdev": 65.13404980841007,
+    "error_range": 237,
+    "local_ports": [
+      38349,
+      38349,
+      38349,
+      38349,
+      38349,
+      38349,
+      38349,
+      38349,
+      38349
+    ],
+    "max_port": 5266,
+    "min_port": 5080,
+    "needs_scan": true,
+    "pattern_type": "random_like",
+    "port_range": 186,
+    "port_rate": 0.0,
+    "predicted_port": 5187,
+    "predicted_shift": 0,
+    "prediction_delay": 2.0,
+    "prediction_source": "extrapoliert",
+    "probed_ports": [
+      5187,
+      5182,
+      5114,
+      5080,
+      5266,
+      5227,
+      5266,
+      5188,
+      5098
+    ],
+    "scan_end": 5266,
+    "scan_start": 5080
+  },
+  "input": {
+    "prediction_mode": "delta",
+    "prediction_range_extra_pct": 0.0,
+    "probes": [
+      {
+        "local_port": 38349,
+        "nat_port": 5187,
+        "ts": 1788145883.8064146
+      },
+      {
+        "local_port": 38349,
+        "nat_port": 5182,
+        "ts": 1788145886.956476
+      },
+      {
+        "local_port": 38349,
+        "nat_port": 5114,
+        "ts": 1788145889.1389925
+      },
+      {
+        "local_port": 38349,
+        "nat_port": 5080,
+        "ts": 1788145890.2840986
+      },
+      {
+        "local_port": 38349,
+        "nat_port": 5266,
+        "ts": 1788145892.41387
+      },
+      {
+        "local_port": 38349,
+        "nat_port": 5227,
+        "ts": 1788145894.583979
+      },
+      {
+        "local_port": 38349,
+        "nat_port": 5266,
+        "ts": 1788145896.7513375
+      },
+      {
+        "local_port": 38349,
+        "nat_port": 5188,
+        "ts": 1788145898.9240408
+      },
+      {
+        "local_port": 38349,
+        "nat_port": 5098,
+        "ts": 1788145901.071066
+      }
+    ],
+    "target_local_port": 38349
+  }
+}

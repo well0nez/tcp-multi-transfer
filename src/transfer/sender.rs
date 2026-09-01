@@ -6,31 +6,21 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use bytes::Buf;
 use crc32fast::Hasher;
 use anyhow::{Result, anyhow};
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 use crate::protocol::transfer::*;
 use super::helpers::*;
 
-/// Buffer size for file I/O (16MB)
-const BUFFER_SIZE: usize = 16 * 1024 * 1024;
-
 /// Progress update chunk size for socket writes (256KB)
 const PROGRESS_IO_CHUNK: usize = 256 * 1024;
 
-/// Pipeline depth for async I/O (16 chunks = ~128MB in flight at 8MB chunks)
-const PIPELINE_DEPTH: usize = 16;
-
-/// Timeout for individual read/write operations
-const IO_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Protocol timeout for handshake
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+use super::{IO_TIMEOUT, HANDSHAKE_TIMEOUT};
 
 /// Sender handshake
 async fn handshake_sender(stream: &mut TcpStream) -> Result<()> {
@@ -63,8 +53,13 @@ async fn handshake_sender(stream: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn send_stream_info(stream: &mut TcpStream, stream_index: u32, total_streams: u32) -> Result<()> {
-    let info = StreamInfoMessage { stream_index, total_streams };
+async fn send_stream_info(
+    stream: &mut TcpStream,
+    stream_index: u32,
+    total_streams: u32,
+    chunk_size: u32,
+) -> Result<()> {
+    let info = StreamInfoMessage { stream_index, total_streams, chunk_size };
     write_all_timeout(stream, &info.encode(), HANDSHAKE_TIMEOUT).await?;
 
     let mut buf = [0u8; 1];
@@ -94,7 +89,6 @@ async fn send_file_info_on_stream(
     };
 
     info!("Sending file info: {} ({:.2} MB)", filename, file_size as f64 / (1024.0 * 1024.0));
-    info!("Chunk size: {} KB", super::get_chunk_size() / 1024);
 
     write_all_timeout(stream, &file_info.encode(), HANDSHAKE_TIMEOUT).await?;
 
@@ -131,77 +125,15 @@ async fn write_payload_with_progress(
     Ok(())
 }
 
-pub struct TcpSender {
-    stream: TcpStream,
-    file_path: String,
-    file_size: u64,
-    sha256: [u8; 32],
-}
-
-impl TcpSender {
-    pub fn new_with_hash(stream: TcpStream, file_path: &str, file_size: u64, sha256: [u8; 32]) -> Self {
-        Self { stream, file_path: file_path.to_string(), file_size, sha256 }
-    }
-
-    pub async fn run(&mut self) -> Result<()> {
-        let start = Instant::now();
-        handshake_sender(&mut self.stream).await?;
-        send_file_info_on_stream(&mut self.stream, &self.file_path, self.file_size, self.sha256).await?;
-        
-        let filename = Path::new(&self.file_path).file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-        let progress = ProgressTracker::new(self.file_size, filename);
-        let sent_bytes = progress.bytes();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(PIPELINE_DEPTH);
-        let chunk_size = super::get_chunk_size();
-        let file_path = self.file_path.clone();
-        
-        info!("Starting PIPELINED file transfer (depth={})...", PIPELINE_DEPTH);
-        
-        let reader_handle = tokio::spawn(async move {
-            let file = File::open(&file_path).await?;
-            let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
-            let mut buffer = vec![0u8; chunk_size];
-            loop {
-                let n = reader.read(&mut buffer).await?;
-                if n == 0 { break; }
-                if tx.send(bytes::Bytes::copy_from_slice(&buffer[..n])).await.is_err() { break; }
-            }
-            Ok::<_, anyhow::Error>(())
-        });
-        
-        let mut total_sent: u64 = 0;
-        while let Some(data) = rx.recv().await {
-            write_payload_with_progress(&mut self.stream, &data, IO_TIMEOUT, &sent_bytes).await?;
-            total_sent += data.len() as u64;
-        }
-        
-        reader_handle.await.map_err(|e| anyhow!("Reader task panicked: {}", e))??;
-        self.stream.flush().await?;
-        progress.set_position(total_sent);
-        
-        let done = encode_simple(MessageType::Done);
-        write_all_timeout(&mut self.stream, &done, HANDSHAKE_TIMEOUT).await?;
-        info!("Sent DONE, waiting for final ACK...");
-        
-        let mut buf = [0u8; 1];
-        read_exact_timeout(&mut self.stream, &mut buf, Duration::from_secs(120)).await?;
-        if buf[0] != MessageType::Ack as u8 { return Err(anyhow!("Expected final ACK, got type {}", buf[0])); }
-        
-        let elapsed = start.elapsed();
-        let speed_mbit = (self.file_size as f64 * 8.0) / 1_000_000.0 / elapsed.as_secs_f64();
-        progress.finish_with_message(format!("Transfer complete! ({:.1} Mbit/s)", speed_mbit));
-        info!("Transfer complete: {:.2} MB in {:.1}s ({:.1} Mbit/s)", self.file_size as f64 / 1048576.0, elapsed.as_secs_f64(), speed_mbit);
-        Ok(())
-    }
-}
-
 pub async fn run_multi_sender(
     mut streams: Vec<TcpStream>,
     file_path: &str,
     file_size: u64,
     sha256: [u8; 32],
-) -> Result<()> {
+) -> Result<super::TransferReport> {
     if streams.is_empty() { return Err(anyhow!("No streams")); }
+    let start = Instant::now();
+    let stream_count = streams.len();
     info!("Using {} streams in connection order", streams.len());
     
     for (i, stream) in streams.iter().enumerate() {
@@ -211,18 +143,32 @@ pub async fn run_multi_sender(
     }
     
     let total_streams = streams.len();
-    for (i, stream) in streams.iter_mut().enumerate() {
-        // Handshake + FileInfo only on first stream (heavy protocol setup)
-        if i == 0 {
-            handshake_sender(stream).await?;
-            send_file_info_on_stream(stream, file_path, file_size, sha256).await?;
+    // Der Sender legt die Blockgroesse fest und teilt sie mit; sie darf nicht
+    // auf beiden Seiten unabhaengig geraten werden.
+    let chunk_size = super::chunk_size_fuer(file_size, total_streams);
+    info!("Block size {} KB for {:.2} MB across {} streams",
+          chunk_size / 1024, file_size as f64 / 1048576.0, total_streams);
+
+    // Der erste Strom traegt den Handschlag; faellt der aus, geht gar nichts.
+    handshake_sender(&mut streams[0]).await?;
+    send_file_info_on_stream(&mut streams[0], file_path, file_size, sha256).await?;
+
+    // Die uebrigen duerfen einzeln ausfallen. Enden die Seiten mit
+    // unterschiedlich vielen Verbindungen — eine Seite meldet established, die
+    // andere gibt nach Wiederholungen auf —, ist die Gegenstelle eines Stroms
+    // zu. Frueher riss das den ganzen Transfer mit; jetzt faellt nur dieser
+    // Strom weg.
+    let mut brauchbar = Vec::with_capacity(streams.len());
+    for (i, mut stream) in streams.into_iter().enumerate() {
+        match send_stream_info(&mut stream, i as u32, total_streams as u32, chunk_size as u32).await {
+            Ok(()) => brauchbar.push(stream),
+            Err(e) if i == 0 => return Err(e),
+            Err(e) => warn!("Stream {} dropped during setup: {}", i, e),
         }
-        
-        // StreamInfo on ALL streams (lightweight stream validation)
-        send_stream_info(stream, i as u32, total_streams as u32).await?;
     }
-    
-    let chunk_size = super::get_chunk_size();
+    let streams = brauchbar;
+    if streams.is_empty() { return Err(anyhow!("No usable stream left")); }
+    let nach_setup = Instant::now();
     let total_chunks = ((file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
     let pending = Arc::new(Mutex::new((0..total_chunks).collect::<VecDeque<_>>()));
     let notify = Arc::new(Notify::new());
@@ -262,6 +208,7 @@ pub async fn run_multi_sender(
     if completed_chunks.load(Ordering::Relaxed) as u32 != total_chunks {
         return Err(anyhow!("Transfer incomplete"));
     }
+    let nach_nutzlast = Instant::now();
     
     let mut done_stream = returned_streams.into_iter().next().ok_or_else(|| anyhow!("No stream for Done"))?;
     
@@ -273,7 +220,15 @@ pub async fn run_multi_sender(
     
     progress.set_position(file_size);
     progress.finish_with_message("Transfer complete!".to_string());
-    Ok(())
+    Ok(super::TransferReport {
+        bytes: file_size,
+        streams: stream_count,
+        setup_ms: (nach_setup - start).as_secs_f64() * 1000.0,
+        payload_ms: (nach_nutzlast - nach_setup).as_secs_f64() * 1000.0,
+        finish_ms: nach_nutzlast.elapsed().as_secs_f64() * 1000.0,
+        total_ms: start.elapsed().as_secs_f64() * 1000.0,
+        tcp_info: crate::netinfo::tcp_info(&done_stream),
+    })
 }
 
 async fn sender_worker(
@@ -301,7 +256,14 @@ async fn sender_worker(
             Some(id) => id,
             None => {
                 if completed_chunks.load(Ordering::Relaxed) as u32 >= total_chunks { break; }
-                notify.notified().await;
+                // Mit Zeitgrenze warten. `notify_waiters()` weckt nur, wer
+                // bereits registriert ist — zwischen der Pruefung oben und der
+                // Registrierung hier kann das letzte Weckzeichen fallen, und
+                // der Worker schliefe fuer immer, waehrend der Aufrufer auf ihn
+                // wartet. Die Schleife prueft die Bedingung ohnehin erneut.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(200), notify.notified()
+                ).await;
                 continue;
             }
         };
@@ -324,6 +286,9 @@ async fn sender_worker(
         
         match read_chunk_ack_message(&mut stream).await {
             Ok(ack) if ack.is_nack => {
+                // Der Block kommt noch einmal — die schon gezaehlten Bytes
+                // wieder abziehen, sonst laeuft die Anzeige ueber 100 %.
+                sent_bytes.fetch_sub(len as u64, Ordering::Relaxed);
                 pending.lock().await.push_back(chunk_id);
                 notify.notify_one();
             }

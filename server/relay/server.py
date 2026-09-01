@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Dict, List, Optional
 
-from ..models import Peer, NATAnalysis
+from ..models import Peer, NATAnalysis, SessionState
 from ..session_manager import SessionManager
 from .utils import send_message, send_error
 from .handlers import wait_for_peer_messages
@@ -18,6 +18,44 @@ MIN_PORT = 1024
 MAX_PORT = 65535
 
 
+async def pruefe_filter(ip: str, nat_port: int) -> str:
+    """Laesst die NAT ein SYN von einem Absenderport durch, an den nie gesendet wurde?
+
+    Der Client haelt gerade eine Probe-Verbindung von (ip, nat_port) zu uns
+    offen — das Mapping lebt also nachweislich. Wir verbinden nun von einem
+    Ephemeralport dieses Servers zurueck auf genau dieses (ip, nat_port). An
+    diesen Absenderport hat der Client nie gesendet:
+
+      * **abgelehnt** (RST) — die NAT hat das SYN weitergereicht, der Kernel des
+        Clients hat mangels passendem Socket geantwortet. Die Filterung haengt
+        also nur an der Adresse. Praktische Folge: die Gegenstelle muss unsere
+        Ports gar nicht abscannen, ein beliebiges SYN kommt durch, sobald sie
+        einmal an unsere Adresse gesendet hat.
+      * **Zeitablauf** — die NAT hat verworfen. Filterung adress- *und*
+        portabhaengig; nur der abgestimmte Punch hilft.
+
+    Ein einzelnes SYN an dieselbe Adresse, von der die Probe gerade kam.
+    """
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, nat_port), timeout=2.0
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        # Verbindung kam sogar zustande: durchgelassen.
+        return "adressabhaengig"
+    except ConnectionRefusedError:
+        return "adressabhaengig"
+    except asyncio.TimeoutError:
+        return "adress_und_portabhaengig"
+    except OSError as exc:
+        logger.debug(f"Filter test against {ip}:{nat_port} inconclusive: {exc}")
+        return "unbestimmt"
+
+
 class TCPRelayServerICE:
     """TCP Hole Punch Relay Server with NAT Probing"""
     
@@ -26,11 +64,17 @@ class TCPRelayServerICE:
         host: str = '0.0.0.0',
         port: int = 9999,
         probe_port: int = 9998,
-        max_scan_ports: int = 512,
+        max_scan_ports: int = 64,
+        probe_port2: int = None,
     ):
         self.host = host
         self.port = port
         self.probe_port = probe_port
+        # Zweiter Probe-Port auf derselben Adresse. Ohne ihn laesst sich nicht
+        # entscheiden, ob das Mapping vom Ziel abhaengt (RFC 4787) — und genau
+        # davon haengt ab, ob der am Relay gemessene Port fuer die Gegenstelle
+        # ueberhaupt gilt.
+        self.probe_port2 = probe_port2 if probe_port2 else probe_port - 1
         self.max_scan_ports = max(1, max_scan_ports)
         self.session_manager = SessionManager()
     
@@ -49,14 +93,21 @@ class TCPRelayServerICE:
             self.host,
             self.probe_port
         )
+        probe_server2 = await asyncio.start_server(
+            self.handle_probe,
+            self.host,
+            self.probe_port2
+        )
         
         logger.info(f"TCP Relay Server v3.0 (ICE-Lite) listening on {self.host}:{self.port}")
-        logger.info(f"NAT Probe Server listening on {self.host}:{self.probe_port}")
+        logger.info(f"NAT Probe Server listening on {self.host}:{self.probe_port} "
+                    f"und {self.host}:{self.probe_port2}")
         logger.info("Features: NAT Probing, Pattern Detection, Port Prediction")
         
         await asyncio.gather(
             main_server.serve_forever(),
-            probe_server.serve_forever()
+            probe_server.serve_forever(),
+            probe_server2.serve_forever()
         )
     
     async def handle_probe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -76,19 +127,33 @@ class TCPRelayServerICE:
             session_id = msg.get('session_id')
             local_port = msg.get('local_port', 0)
             probe_num = msg.get('probe_num', 0)
+            halten = bool(msg.get('hold'))
             
             if not session_id:
                 return
             
-            # Record this probe
+            # Record this probe. Der Zielport gehoert dazu: nur mit ihm laesst
+            # sich spaeter sagen, ob das Mapping vom Ziel abhing.
             ip, nat_port = addr
             ts = time.time()
-            logger.debug(f"Probe #{probe_num} from {session_id}: local={local_port} nat={nat_port}")
+            ziel_port = writer.get_extra_info('sockname')[1]
+            logger.debug(f"Probe #{probe_num} from {session_id}: local={local_port} "
+                         f"nat={nat_port} ziel={ziel_port}")
             
             if session_id not in self.session_manager.pending_probes:
                 self.session_manager.pending_probes[session_id] = []
-            self.session_manager.pending_probes[session_id].append((ip, nat_port, local_port, ts))
+            self.session_manager.pending_probes[session_id].append(
+                (ip, nat_port, local_port, ts, ziel_port))
             
+            # Filtertest, solange diese Verbindung offen ist: nur dann ist das
+            # Mapping nachweislich lebendig. Nach dem Schliessen der Probe
+            # kann die NAT es laengst freigegeben haben, und ein Zeitablauf
+            # waere dann kein Beleg fuer Filterung, sondern fuer Vergesslichkeit.
+            if halten:
+                ergebnis = await pruefe_filter(ip, nat_port)
+                self.session_manager.filter_ergebnis[(session_id, ip)] = ergebnis
+                logger.info(f"Filter test {ip}:{nat_port} -> {ergebnis}")
+
             # Send ACK with observed port
             await send_message(writer, {
                 'type': 'probe_ack',
@@ -112,6 +177,9 @@ class TCPRelayServerICE:
         
         peer = None
         session_id = None
+        # Erst wenn der Peer wirklich in der Sitzung steht, darf er sie beim
+        # Verlassen auch abraeumen.
+        registriert = False
         
         try:
             data = await asyncio.wait_for(reader.readline(), timeout=300.0)
@@ -128,7 +196,6 @@ class TCPRelayServerICE:
             role = msg['role']
             local_port = msg.get('local_port', 0)
             private_ip = msg.get('private_ip')
-            skip_probing = msg.get('skip_probing', False)
             prediction_mode = (msg.get('prediction_mode') or 'delta').lower()
             if prediction_mode not in ('delta', 'external'):
                 logger.warning(f"Unknown prediction_mode '{prediction_mode}', defaulting to 'delta'")
@@ -144,6 +211,10 @@ class TCPRelayServerICE:
             tcp_connections = msg.get('tcp_connections', 1)
             
             extra_ports = msg.get('extra_ports', [])
+            try:
+                punch_ports = max(1, int(msg.get('punch_ports') or 1))
+            except (TypeError, ValueError):
+                punch_ports = 1
             
             if role not in ('sender', 'receiver'):
                 await send_error(writer, f"Invalid role: {role}")
@@ -160,6 +231,7 @@ class TCPRelayServerICE:
                 prediction_mode=prediction_mode,
                 prediction_range_extra_pct=prediction_range_extra_pct,
                 tcp_connections=tcp_connections,
+                punch_ports=punch_ports,
             )
             
             if extra_ports:
@@ -170,15 +242,16 @@ class TCPRelayServerICE:
             
             async with lock:
                 if session_id not in self.session_manager.sessions:
-                    self.session_manager.sessions[session_id] = {}
+                    self.session_manager.sessions[session_id] = SessionState()
                 
                 session = self.session_manager.sessions[session_id]
                 
-                if role in session:
+                if session.peer(role) is not None:
                     await send_error(writer, f"Role '{role}' already taken")
                     return
                 
-                session[role] = peer
+                session.setze(role, peer)
+                registriert = True
                 logger.info(f"Registered {role} for session {session_id}: {addr}, local_port={local_port}")
             
             # Calculate initial delta
@@ -186,7 +259,7 @@ class TCPRelayServerICE:
             port_preserved = (initial_delta == 0)
             
             # Determine if probing is needed
-            peer.needs_probing = not skip_probing and not port_preserved
+            peer.needs_probing = not port_preserved
             peer.probes_done = not peer.needs_probing
             
             # Create basic NAT analysis for port-preserved case
@@ -201,17 +274,23 @@ class TCPRelayServerICE:
                     predicted_port=predicted_port,
                     error_range=0,
                     pattern_type="port_preserved",
+                    allocation="portbewahrend",
+                    hit_probability=1.0,
                     needs_scan=False,
                     scan_start=predicted_port,
                     scan_end=predicted_port,
                 )
             
-            # Collect multiple timestamps for robust time synchronization
-            # Using 5 samples with 50ms intervals for median-based offset calculation
-            server_times = []
-            for _ in range(5):
-                server_times.append(time.time())
-                await asyncio.sleep(0.05)  # 50ms between samples
+            # Ein Zeitstempel, moeglichst spaet gelesen.
+            #
+            # Frueher standen hier fuenf Stempel im Abstand von 50 ms — in
+            # *einer* Nachricht. Ein Median darueber ist deterministisch der
+            # dritte Wert; unabhaengiges Rauschen, gegen das ein Median helfen
+            # wuerde, gibt es dabei gar nicht. Gekostet hat es 250 ms je
+            # Anmeldung. Der Client korrigiert stattdessen um die halbe
+            # Umlaufzeit, die er selbst misst — und braucht ohnehin nur grobe
+            # Genauigkeit, weil die Punch-Fenster beider Seiten Sekunden lang
+            # ueberlappen.
             
             # Send registration ACK with multiple timestamps
             await send_message(writer, {
@@ -219,12 +298,18 @@ class TCPRelayServerICE:
                 'your_public_addr': list(addr),
                 'your_role': role,
                 'session_id': session_id,
-                'server_time': server_times[0],  # Keep first for backward compat
-                'server_times': server_times,
+                'server_time': time.time(),
                 'initial_delta': initial_delta,
                 'port_preserved': port_preserved,
                 'needs_probing': peer.needs_probing,
-                'probe_port': self.probe_port if peer.needs_probing else None
+                # Der Probe-Port wird immer mitgeteilt. Auch eine
+                # portbewahrende NAT muss ihr *Filter*verhalten offenlegen —
+                # davon haengt ab, ob die Gegenstelle unsere Ports ueberhaupt
+                # abscannen muss. Ohne Probing genuegt dafuer eine einzige
+                # gehaltene Verbindung.
+                'probe_port': self.probe_port,
+                'probe_port2': self.probe_port2 if peer.needs_probing else None,
+                'filter_test': True
             })
             
             logger.info(f"Peer {role}: port_preserved={port_preserved}, needs_probing={peer.needs_probing}")
@@ -237,7 +322,11 @@ class TCPRelayServerICE:
         except Exception as e:
             logger.error(f"Error handling client {addr}: {e}", exc_info=True)
         finally:
-            if session_id and peer:
+            # Eine abgelehnte Doppelregistrierung darf die laufende Sitzung
+            # nicht anfassen: `cleanup_peer` loescht sonst den *unschuldigen*
+            # Gegenpeer und wirft die ganze Sitzung weg, waehrend der
+            # rechtmaessige Peer verbunden bleibt und verwaist.
+            if session_id and peer and registriert:
                 await self.session_manager.cleanup_peer(session_id, peer)
             try:
                 writer.close()

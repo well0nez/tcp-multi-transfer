@@ -10,6 +10,7 @@ from typing import List
 
 from ..models import Peer, NATAnalysis
 from ..nat_analyzer import analyze_nat
+from .. import fixtures
 from .utils import send_message
 
 logger = logging.getLogger(__name__)
@@ -80,20 +81,21 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
     
     if session_id in session_manager.pending_probes:
         probes = session_manager.pending_probes[session_id]
-        peer_probes = [(ip, nat, local, ts) for ip, nat, local, ts in probes
-                       if ip == peer.public_addr[0] and local in ports]
+        peer_probes = [pr for pr in probes
+                       if pr[0] == peer.public_addr[0] and pr[2] in ports]
         
         if peer_probes:
             logger.info(f"Found {len(peer_probes)} probes for new ports from {peer.role}")
             
-            for _, nat_port, local_port, _ in peer_probes:
+            for pr in peer_probes:
+                nat_port, local_port = pr[1], pr[2]
                 if (local_port, nat_port) not in peer.probe_ports:
                     peer.probe_ports.append((local_port, nat_port))
                     logger.debug(f"  Added mapping: local {local_port} -> NAT {nat_port}")
             
             session_manager.pending_probes[session_id] = [
-                (ip, nat, local, ts) for ip, nat, local, ts in probes
-                if not (ip == peer.public_addr[0] and local in ports)
+                pr for pr in probes
+                if not (pr[0] == peer.public_addr[0] and pr[2] in ports)
             ]
         else:
             logger.warning(f"No probes received yet for new ports from {peer.role}")
@@ -106,20 +108,24 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
     })
     logger.info(f"Sent ports_added_ack to {peer.role} for {len(ports)} ports")
     
+    # Unter dem Lock wird nur entschieden, gesendet wird danach: `drain()`
+    # blockiert, bis die Gegenstelle liest, und haelt sonst die ganze Sitzung
+    # an — auch `cleanup_peer` des anderen Peers.
+    nachrichten = []
     lock = session_manager.get_session_lock(session_id)
     async with lock:
         session = session_manager.sessions.get(session_id)
         if session:
-            other_peer = session.get('sender' if peer.role == 'receiver' else 'receiver')
+            other_peer = session.gegenseite(peer.role)
             if other_peer:
-                await send_message(other_peer.writer, {
+                nachrichten.append((other_peer.writer, {
                     'type': 'peer_added_ports',
                     'ports': ports
-                })
+                }))
                 logger.info(f"Notified {other_peer.role} about {len(ports)} new ports from {peer.role}")
             
-            if 'retry_add_ports_pending' in session and session.get('retry_add_ports_pending'):
-                for conn_num, pending in list(session['retry_add_ports_pending'].items()):
+            if session.retry_pending:
+                for conn_num, pending in list(session.retry_pending.items()):
                     if not pending.get(peer.role):
                         # Map the new retry port to the original connection index
                         new_port = ports[0]
@@ -140,8 +146,7 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
                         pending[peer.role] = True
                         logger.info(f"Session {session_id}: Peer {peer.role} sent add_ports for retry connection {conn_num}")
                         
-                        sender = session.get('sender')
-                        receiver = session.get('receiver')
+                        sender, receiver = session.beide()
                         
                         if sender and receiver and pending.get('sender') and pending.get('receiver'):
                             logger.info(f"Session {session_id}: BOTH peers sent add_ports for retry connection {conn_num} - coordinating retry")
@@ -150,7 +155,7 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
                             
                             max_scan_ports = pending.get('max_scan_ports', 100)
                             
-                            asyncio.create_task(
+                            session.retry_koordination[conn_num] = asyncio.create_task(
                                 coordinate_retry_connection(
                                     session_id,
                                     session_manager,
@@ -159,10 +164,16 @@ async def handle_add_ports(msg: dict, peer: Peer, session_manager):
                                 )
                             )
                             
-                            del session['retry_add_ports_pending'][conn_num]
+                            session.retry_pending.pop(conn_num, None)
                             logger.info(f"Session {session_id}: Retry coordination task started for connection {conn_num}")
                         
                         break
+
+    for writer, msg in nachrichten:
+        try:
+            await send_message(writer, msg)
+        except Exception as exc:
+            logger.warning(f"Could not notify peer: {exc}")
 
     if not retry_mapped:
         peer.bound_ports.extend(ports)
@@ -173,13 +184,22 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
     session_id = peer.session_id
 
     if not peer.needs_probing:
+        # Kein Portband zu schaetzen, aber das Filterverhalten interessiert
+        # trotzdem: es entscheidet, ob die Gegenstelle scannen muss.
+        if peer.nat_analysis:
+            peer.nat_analysis.filtering_behaviour = session_manager.filter_ergebnis.pop(
+                (session_id, peer.public_addr[0]), "unbestimmt"
+            )
+            logger.info(
+                f"Peer {peer.role}: allocation={peer.nat_analysis.allocation}, "
+                f"filtering={peer.nat_analysis.filtering_behaviour}"
+            )
         peer.probes_done = True
         logger.info(f"Peer {peer.role} probes_done=True (no probing required)")
     else:
         if session_id in session_manager.pending_probes:
             probes = session_manager.pending_probes[session_id]
-            peer_probes = [(ip, nat, local, ts) for ip, nat, local, ts in probes
-                           if ip == peer.public_addr[0]]
+            peer_probes = [pr for pr in probes if pr[0] == peer.public_addr[0]]
             
             if peer_probes:
                 logger.info(f"Analyzing {len(peer_probes)} probes from {peer.role}")
@@ -189,9 +209,15 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
                     peer.prediction_mode,
                     peer.prediction_range_extra_pct,
                 )
+                fixtures.record(
+                    peer_probes,
+                    peer.local_port,
+                    peer.prediction_mode,
+                    peer.prediction_range_extra_pct,
+                    peer.nat_analysis,
+                )
                 session_manager.pending_probes[session_id] = [
-                    (ip, nat, local, ts) for ip, nat, local, ts in probes
-                    if ip != peer.public_addr[0]
+                    pr for pr in probes if pr[0] != peer.public_addr[0]
                 ]
             else:
                 logger.warning(f"No probes received from {peer.role}")
@@ -213,6 +239,16 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
                 scan_end=peer.public_addr[1],
             )
         
+        if peer.nat_analysis:
+            peer.nat_analysis.filtering_behaviour = session_manager.filter_ergebnis.pop(
+                (session_id, peer.public_addr[0]), "unbestimmt"
+            )
+            logger.info(
+                f"Peer {peer.role}: allocation={peer.nat_analysis.allocation}, "
+                f"mapping={peer.nat_analysis.mapping_behaviour}, "
+                f"filtering={peer.nat_analysis.filtering_behaviour}"
+            )
+
         peer.probes_done = True
         logger.info(f"Peer {peer.role} probes_done=True")
     
@@ -220,8 +256,7 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
     async with lock:
         session = session_manager.sessions.get(session_id)
         if session:
-            sender = session.get('sender')
-            receiver = session.get('receiver')
+            sender, receiver = session.beide()
             
             if sender and receiver and sender.probes_done and receiver.probes_done:
                 tcp_connections = sender.tcp_connections or receiver.tcp_connections or 1
@@ -230,7 +265,10 @@ async def handle_probes_complete(peer: Peer, session_manager, max_scan_ports: in
                 
                 from .coordinator import coordinate_multi_connections
                 
-                asyncio.create_task(
+                # Referenz festhalten: eine Aufgabe ohne Referenz kann vom
+                # Aufraeumer eingesammelt werden, und ihre Ausnahmen gingen
+                # still verloren.
+                session.koordination = asyncio.create_task(
                     coordinate_multi_connections(
                         session_id,
                         session_manager,
@@ -251,8 +289,9 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager, max_scan_
     
     logger.info(f"Peer {peer.role} requests retry for connection {conn_num}")
     
-    if not hasattr(peer, 'retry_requested'):
-        peer.retry_requested = {}
+    # Wie oben: erst entscheiden, dann ausserhalb des Locks senden.
+    nachher = []
+    
     peer.retry_requested[conn_num] = True
     
     lock = session_manager.get_session_lock(session_id)
@@ -262,35 +301,22 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager, max_scan_
             logger.error(f"Session {session_id} not found for retry_request")
             return
         
-        sender = session.get('sender')
-        receiver = session.get('receiver')
+        sender, receiver = session.beide()
         
         if not sender or not receiver:
             logger.error(f"Session {session_id}: Missing sender or receiver for retry_request")
             return
         
-        if not hasattr(sender, 'retry_requested'):
-            sender.retry_requested = {}
-        if not hasattr(receiver, 'retry_requested'):
-            receiver.retry_requested = {}
-        
         if sender.retry_requested.get(conn_num) and receiver.retry_requested.get(conn_num):
             logger.info(f"Session {session_id}: Both peers want retry for connection {conn_num} - granting!")
             
             # Cancel timeout task if it exists
-            timeout_key = f'retry_timeout_task_{conn_num}'
-            if timeout_key in session:
-                session[timeout_key].cancel()
-                del session[timeout_key]
+            aufgabe = session.retry_tasks.pop(conn_num, None)
+            if aufgabe:
+                aufgabe.cancel()
             
-            await send_message(sender.writer, {
-                'type': 'retry_granted',
-                'connection_num': conn_num
-            })
-            await send_message(receiver.writer, {
-                'type': 'retry_granted',
-                'connection_num': conn_num
-            })
+            nachher.append((sender.writer, {'type': 'retry_granted', 'connection_num': conn_num}))
+            nachher.append((receiver.writer, {'type': 'retry_granted', 'connection_num': conn_num}))
             
             sender.retry_requested[conn_num] = False
             receiver.retry_requested[conn_num] = False
@@ -298,9 +324,7 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager, max_scan_
             sender.ready_for_connection[conn_num] = False
             receiver.ready_for_connection[conn_num] = False
             
-            if 'retry_add_ports_pending' not in session:
-                session['retry_add_ports_pending'] = {}
-            session['retry_add_ports_pending'][conn_num] = {
+            session.retry_pending[conn_num] = {
                 'sender': False,
                 'receiver': False,
                 'max_scan_ports': max_scan_ports,
@@ -309,14 +333,19 @@ async def handle_retry_request(msg: dict, peer: Peer, session_manager, max_scan_
             logger.info(f"Session {session_id}: Retry granted for connection {conn_num}, waiting for add_ports from BOTH peers")
         else:
             # Start timeout task if not already started
-            timeout_key = f'retry_timeout_task_{conn_num}'
-            if timeout_key not in session:
+            if conn_num not in session.retry_tasks:
                 logger.info(f"Session {session_id}: Starting retry coordination timeout (45s) for connection {conn_num}")
-                session[timeout_key] = asyncio.create_task(
+                session.retry_tasks[conn_num] = asyncio.create_task(
                     retry_coordination_timeout(session_id, conn_num, 45.0, session_manager)
                 )
             else:
                 logger.info(f"Session {session_id}: Waiting for other peer to request retry for connection {conn_num}")
+
+    for writer, msg in nachher:
+        try:
+            await send_message(writer, msg)
+        except Exception as exc:
+            logger.warning(f"Could not deliver retry_granted: {exc}")
 
 
 async def retry_coordination_timeout(session_id: str, conn_num: int, timeout_sec: float, session_manager):
@@ -330,14 +359,13 @@ async def retry_coordination_timeout(session_id: str, conn_num: int, timeout_sec
             logger.debug(f"Session {session_id} no longer exists (timeout cleanup)")
             return
         
-        sender = session.get('sender')
-        receiver = session.get('receiver')
+        sender, receiver = session.beide()
         
         if not sender or not receiver:
             return
         
-        sender_waiting = getattr(sender, 'retry_requested', {}).get(conn_num, False)
-        receiver_waiting = getattr(receiver, 'retry_requested', {}).get(conn_num, False)
+        sender_waiting = sender.retry_requested.get(conn_num, False)
+        receiver_waiting = receiver.retry_requested.get(conn_num, False)
         
         # If both are now waiting, they already got granted (race condition)
         if sender_waiting and receiver_waiting:
@@ -345,27 +373,27 @@ async def retry_coordination_timeout(session_id: str, conn_num: int, timeout_sec
             return
         
         # If only one is waiting, send retry_rejected
+        abzusenden = None
         if sender_waiting and not receiver_waiting:
             logger.warning(f"Session {session_id}: Retry coordination timeout - receiver missing for conn {conn_num}")
-            await send_message(sender.writer, {
-                'type': 'retry_rejected',
-                'connection_num': conn_num,
-                'reason': 'peer_missing'
-            })
+            abzusenden = sender.writer
             sender.retry_requested[conn_num] = False
         elif receiver_waiting and not sender_waiting:
             logger.warning(f"Session {session_id}: Retry coordination timeout - sender missing for conn {conn_num}")
-            await send_message(receiver.writer, {
+            abzusenden = receiver.writer
+            receiver.retry_requested[conn_num] = False
+        
+        session.retry_tasks.pop(conn_num, None)
+
+    if abzusenden is not None:
+        try:
+            await send_message(abzusenden, {
                 'type': 'retry_rejected',
                 'connection_num': conn_num,
                 'reason': 'peer_missing'
             })
-            receiver.retry_requested[conn_num] = False
-        
-        # Clean up timeout task
-        timeout_key = f'retry_timeout_task_{conn_num}'
-        if timeout_key in session:
-            del session[timeout_key]
+        except Exception as exc:
+            logger.warning(f"Could not deliver retry_rejected: {exc}")
 
 
 async def handle_conn_result(msg: dict, peer: Peer, session_manager, status: str):
@@ -385,11 +413,9 @@ async def handle_conn_result(msg: dict, peer: Peer, session_manager, status: str
             peer.conn_reasons[conn_num] = str(reason)
         session = session_manager.sessions.get(session_id)
         if session is not None:
-            results = session.setdefault('conn_results', {'sender': {}, 'receiver': {}})
-            results[peer.role][conn_num] = status
+            session.conn_results[peer.role][conn_num] = status
             if reason:
-                reasons = session.setdefault('conn_reasons', {'sender': {}, 'receiver': {}})
-                reasons[peer.role][conn_num] = str(reason)
+                session.conn_reasons[peer.role][conn_num] = str(reason)
     
     if reason:
         logger.info(f"Peer {peer.role} reported {status} for connection {conn_num} (reason={reason})")

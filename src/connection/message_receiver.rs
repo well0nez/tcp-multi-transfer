@@ -1,6 +1,5 @@
 //! Async task for receiving and routing relay messages
 
-use std::time::Duration;
 use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use anyhow::Result;
@@ -26,26 +25,40 @@ pub fn spawn_message_receiver(
             
             let mut line = String::new();
             
-            match tokio::time::timeout(Duration::from_secs(5), relay_reader.read_line(&mut line)).await {
-                Ok(Ok(0)) => {
+            // Ohne Zeitgrenze lesen. `read_line` ist nicht abbruchsicher: wird
+            // es mitten in einer Zeile abgebrochen, sind die bereits gelesenen
+            // Bytes verloren und der Rest der Zeile landet als Bruchstueck im
+            // Parser — die Nachricht (peer_info, GO) ist damit weg. Die
+            // Zeitgrenze diente nur dazu, das Abschaltzeichen zu bemerken;
+            // dafuer bricht der Aufrufer die Aufgabe jetzt gezielt ab.
+            match relay_reader.read_line(&mut line).await {
+                Ok(0) => {
                     if queues.is_shutdown() {
                         info!("Relay connection closed after shutdown");
                         break;
                     }
-                    error!("Connection closed by relay server");
-                    queues.push_error("Connection lost".to_string());
+                    // Nach der letzten abgestimmten Verbindung legen beide
+                    // Seiten die Steuerverbindung auf; der Relay schliesst
+                    // daraufhin auch die des Nachzueglers. Wer als Zweiter
+                    // fertig wird, sieht das immer — es ist der Normalfall.
+                    if queues.ist_letzte_verbindung() {
+                        info!("Relay connection closed - coordination finished");
+                    } else {
+                        error!("Connection closed by relay server");
+                    }
+                    queues.push_error("Transport lost: relay connection closed".to_string());
                     break;
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if queues.is_shutdown() {
                         info!("Relay connection read error after shutdown: {}", e);
                         break;
                     }
                     error!("Read error from relay server: {}", e);
-                    queues.push_error(format!("Read error: {}", e));
+                    queues.push_error(format!("Transport lost: {}", e));
                     break;
                 }
-                Ok(Ok(_)) => {
+                Ok(_) => {
                     if line.trim().is_empty() {
                         continue;
                     }
@@ -54,27 +67,28 @@ pub fn spawn_message_receiver(
                         Ok(msg) => {
                             match msg {
                                 RelayMessage::PeerInfo { 
-                                    connection_num, 
-                                    punch_strategy, 
-                                    peer_public_addr, 
-                                    peer_addresses, 
-                                    peer_nat_analysis, 
-                                    tcp_connections, 
-                                    .. 
+                                    connection_num,
+                                    peer_public_addr,
+                                    peer_addresses,
+                                    peer_nat_analysis,
+                                    your_nat_analysis,
+                                    tcp_connections,
+                                    same_network,
+                                    ..
                                 } => {
                                     let conn = connection_num.unwrap_or(0);
-                                    let strategy = punch_strategy.unwrap_or_else(|| "scan".to_string());
                                     let tcp_conns = tcp_connections.unwrap_or(1);
                                     
                                     if let Some((ip, port)) = RelayMessage::parse_addr(&peer_public_addr) {
-                                        if let Ok(peer_addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() {
+                                        if format!("{}:{}", ip, port).parse::<SocketAddr>().is_ok() {
                                             let peer_info = PeerInfo {
-                                                peer_addr,
                                                 peer_addresses,
+                                                same_network,
                                                 peer_nat_analysis,
+                                                own_nat_analysis: your_nat_analysis,
                                             };
                                             
-                                            queues.push_peer_info(conn, peer_info, strategy, tcp_conns);
+                                            queues.push_peer_info(conn, peer_info, tcp_conns);
                                             debug!("Queued PeerInfo for conn {}", conn);
                                         } else {
                                             warn!("Failed to parse peer address: {}:{}", ip, port);
@@ -95,9 +109,12 @@ pub fn spawn_message_receiver(
                                     debug!("Queued PortsAddedAck for {} ports", ports.len());
                                 }
                                 
+                                // Der Server meldet neue Ports der Gegenstelle;
+                                // die Punch-Ziele kommen aber ausschliesslich aus
+                                // peer_info. Die Nachricht wird deshalb nur
+                                // quittiert, nicht ausgewertet.
                                 RelayMessage::PeerAddedPorts { ports } => {
-                                    queues.push_peer_added_ports(ports.clone());
-                                    debug!("Queued PeerAddedPorts: {:?}", ports);
+                                    debug!("peer_added_ports: {:?} (not used)", ports);
                                 }
                                 
                                 RelayMessage::RetryGranted { connection_num } => {
@@ -124,9 +141,6 @@ pub fn spawn_message_receiver(
                             warn!("Failed to parse message: {} - {}", e, line.trim());
                         }
                     }
-                }
-                Err(_) => {
-                    debug!("Read timeout (keepalive)");
                 }
             }
         }

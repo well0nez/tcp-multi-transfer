@@ -13,13 +13,11 @@ pub enum ConnectionState {
     WaitingForGO { 
         conn_num: u32, 
         peer_info: PeerInfo,
-        strategy: String,
     },
     
     Punching { 
         conn_num: u32, 
         peer_info: PeerInfo,
-        strategy: String,
         start_at: f64,
     },
     
@@ -28,12 +26,10 @@ pub enum ConnectionState {
     Failed { 
         conn_num: u32, 
         reason: String,
-        attempt: u32,
     },
     
     WaitingForRetry { 
         conn_num: u32,
-        attempt: u32,
     },
 }
 
@@ -42,7 +38,6 @@ pub type StateTransition = Result<ConnectionState>;
 pub fn handle_peer_info_transition(
     state: ConnectionState,
     peer_info: PeerInfo,
-    strategy: String,
 ) -> StateTransition {
     match state {
         ConnectionState::WaitingForPeerInfo { conn_num } => {
@@ -50,15 +45,6 @@ pub fn handle_peer_info_transition(
             Ok(ConnectionState::WaitingForGO {
                 conn_num,
                 peer_info,
-                strategy,
-            })
-        }
-        ConnectionState::WaitingForRetry { conn_num, .. } => {
-            debug!("State transition: WaitingForRetry -> WaitingForGO (conn {})", conn_num);
-            Ok(ConnectionState::WaitingForGO {
-                conn_num,
-                peer_info,
-                strategy,
             })
         }
         _ => {
@@ -72,12 +58,11 @@ pub fn handle_go_transition(
     go_signal: GoSignal,
 ) -> StateTransition {
     match state {
-        ConnectionState::WaitingForGO { conn_num, peer_info, strategy } => {
+        ConnectionState::WaitingForGO { conn_num, peer_info } => {
             debug!("State transition: WaitingForGO -> Punching (conn {})", conn_num);
             Ok(ConnectionState::Punching {
                 conn_num,
                 peer_info,
-                strategy,
                 start_at: go_signal.start_at,
             })
         }
@@ -111,7 +96,6 @@ pub fn handle_connection_failure(
             Ok(ConnectionState::Failed {
                 conn_num,
                 reason,
-                attempt: 1,
             })
         }
         ConnectionState::WaitingForPeerInfo { conn_num } => {
@@ -119,7 +103,6 @@ pub fn handle_connection_failure(
             Ok(ConnectionState::Failed {
                 conn_num,
                 reason,
-                attempt: 1,
             })
         }
         ConnectionState::WaitingForGO { conn_num, .. } => {
@@ -127,7 +110,6 @@ pub fn handle_connection_failure(
             Ok(ConnectionState::Failed {
                 conn_num,
                 reason,
-                attempt: 1,
             })
         }
         _ => {
@@ -140,12 +122,9 @@ pub fn handle_retry_request(
     state: ConnectionState,
 ) -> StateTransition {
     match state {
-        ConnectionState::Failed { conn_num, attempt, .. } => {
-            debug!("State transition: Failed -> WaitingForRetry (conn {}, attempt {})", conn_num, attempt + 1);
-            Ok(ConnectionState::WaitingForRetry {
-                conn_num,
-                attempt: attempt + 1,
-            })
+        ConnectionState::Failed { conn_num, .. } => {
+            debug!("State transition: Failed -> WaitingForRetry (conn {})", conn_num);
+            Ok(ConnectionState::WaitingForRetry { conn_num })
         }
         _ => {
             Err(anyhow!("Invalid state transition: cannot request retry in state {:?}", state))
@@ -157,8 +136,8 @@ pub fn handle_retry_granted(
     state: ConnectionState,
 ) -> StateTransition {
     match state {
-        ConnectionState::WaitingForRetry { conn_num, attempt } => {
-            debug!("State transition: WaitingForRetry -> WaitingForPeerInfo (conn {}, attempt {})", conn_num, attempt);
+        ConnectionState::WaitingForRetry { conn_num } => {
+            debug!("State transition: WaitingForRetry -> WaitingForPeerInfo (conn {})", conn_num);
             Ok(ConnectionState::WaitingForPeerInfo { conn_num })
         }
         _ => {

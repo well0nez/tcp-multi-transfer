@@ -15,25 +15,20 @@ use crate::cli::PredictionMode;
 
 /// Session state for hole punch coordination
 pub struct Session {
-    pub peer_public_addr: Option<SocketAddr>,
-    pub peer_addresses: Vec<crate::protocol::relay::PeerAddressInfo>,
-    pub peer_nat_analysis: Option<crate::protocol::NATAnalysis>,
-    pub same_network: bool,
     pub time_offset: f64,
-    pub our_public_port: Option<u16>,
-    pub our_delta: i32,
-    pub port_preserved: bool,
     
     // Multi-TCP fields
     pub tcp_connections: u32,
     pub allow_fallback: bool,
     pub min_connections: u32,
     pub bound_sockets: Vec<Socket>,
-    pub peer_extra_ports: Vec<u16>,
     
     // Server connection info (for probing new ports)
     pub server_addr: SocketAddr,
     pub probe_port: Option<u16>,
+    /// Vergibt die eigene NAT pro 5-Tupel (true) oder pro Verbindung (false)?
+    /// `None` = nicht ermittelt.
+    pub mapping_stable: Option<bool>,
 }
 
 pub fn parse_host_port(input: &str) -> Result<(String, u16)> {
@@ -109,6 +104,185 @@ pub fn create_bound_socket(local_port: u16) -> Result<Socket> {
 
 
 /// Connect to relay server and handle the full protocol
+/// Sendet die NAT-Probes von den **gebundenen Punch-Ports** aus.
+///
+/// Die alte Variante nutzte `TcpStream::connect`, also einen vom Kernel
+/// gewaehlten Ephemeralport. Serverseitig sucht `get_nat_port_for_local_port`
+/// die Probes aber ueber genau den Punch-Port — der stand dort nie drin, also
+/// fiel die Funktion immer in den Praediktionszweig und der Filter in
+/// `handle_add_ports` lief leer.
+///
+/// Mit dieser Variante trifft der Nachschlag, und der primaere Kandidat wird
+/// gemessen statt extrapoliert. Die Extrapolation bleibt trotzdem noetig: bei
+/// symmetrischer NAT haengt das Mapping am Ziel, und das Ziel ist hier der
+/// Probe-Server, nicht der Peer. Der Anker wird nur sauber vergleichbar.
+async fn do_nat_probing_from_bound(
+    probe_addr: SocketAddr,
+    probe_addr2: Option<SocketAddr>,
+    session_id: &str,
+    bound_sockets: &[Socket],
+    count: u32,
+) -> Result<Option<bool>> {
+    let ports: Vec<u16> = bound_sockets
+        .iter()
+        .filter_map(|s| s.local_addr().ok()?.as_socket().map(|a| a.port()))
+        .collect();
+
+    if ports.is_empty() {
+        return Err(anyhow!("No bound ports available for probing"));
+    }
+
+    // Genug Proben, damit jedes Paar (lokaler Port, Ziel) mehrfach vorkommt —
+    // sonst kann weder das Wiederholungsverhalten noch die Zielabhaengigkeit
+    // bestimmt werden. Mit vier gebundenen Ports und den vorgegebenen zehn
+    // Proben blieb je Paar hoechstens eine Probe uebrig, und die Erkennung
+    // lieferte still "unbestimmt".
+    let ziele = if probe_addr2.is_some() { 2 } else { 1 };
+    let noetig = (ports.len() * ziele * 2) as u32;
+    let count = count.max(noetig);
+    if count > ports.len() as u32 * ziele as u32 {
+        debug!("Probenzahl auf {} gesetzt ({} Ports x {} Ziele)", count, ports.len(), ziele);
+    }
+
+    info!("NAT probing: {} connections from {} bound port(s) to {}",
+          count, ports.len(), probe_addr);
+
+    let mut successful = 0;
+    // (lokaler Port, Zielport) -> die vom Server gesehenen NAT-Ports
+    let mut gesehen: std::collections::HashMap<(u16, u16), Vec<u16>> =
+        std::collections::HashMap::new();
+
+    for i in 0..count {
+        // Reihum ueber die Punch-Ports, und abwechselnd gegen beide Zielports.
+        //
+        // Der Wechsel des Ziels hat zwei Gruende. Erstens misst er das
+        // Mapping-Verhalten: derselbe lokale Port gegen zwei Ziele zeigt, ob
+        // die NAT zielabhaengig vergibt. Zweitens vermeidet er ein
+        // handfestes Problem — zwei Verbindungen mit identischem Fuenftupel
+        // gehen nicht gleichzeitig, der Kernel antwortet mit
+        // EADDRNOTAVAIL. Bei nur einem Ziel und einem gebundenen Port fielen
+        // dadurch regelmaessig Proben aus.
+        // Ziel je Probe wechseln, Port erst danach weiterschalten: so bekommt
+        // jedes Paar (Port, Ziel) gleich viele Proben.
+        let ziel = match (probe_addr2, (i as usize) % ziele) {
+            (Some(zweit), 1) => zweit,
+            _ => probe_addr,
+        };
+        let port = ports[((i as usize) / ziele) % ports.len()];
+
+        // Die letzte Probe bleibt offen, bis der Server das Filterverhalten
+        // geprueft hat — sonst testet er gegen ein bereits freigegebenes
+        // Mapping und misst Vergesslichkeit statt Filterung.
+        let letzte = i + 1 == count;
+        match probe_once_from_port(ziel, session_id, port, i, letzte).await {
+            Ok(seen) => {
+                successful += 1;
+                if let Some(nat) = seen {
+                    gesehen.entry((port, ziel.port())).or_default().push(nat);
+                }
+                debug!("  Probe #{} from bound port {} to {} -> {:?}", i, port, ziel, seen);
+            }
+            Err(e) => warn!("  Probe #{} from port {} to {} failed: {}", i, port, ziel, e),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    info!("NAT probing done: {}/{} succeeded", successful, count);
+    Ok(bewerte_mapping(&gesehen))
+}
+
+/// Vergibt die eigene NAT pro 5-Tupel oder pro Verbindung einen Port?
+///
+/// Mehrere Proben vom **selben** lokalen Port zum **selben** Ziel bilden
+/// dasselbe 5-Tupel. Bekommt der Server dabei immer denselben Absenderport zu
+/// sehen, ist das Mapping stabil und eine Vorspannung kann es fuer die spaetere
+/// echte Verbindung offenhalten. Wechselt der Port, vergibt die NAT pro
+/// Verbindung neu — dann ist jede Vorspannung wirkungslos, weil die echte
+/// Verbindung ohnehin ein anderes Mapping bekommt.
+///
+/// `None` heisst: zu wenig Daten fuer eine Aussage.
+fn bewerte_mapping(gesehen: &std::collections::HashMap<(u16, u16), Vec<u16>>) -> Option<bool> {
+    let mut entschieden = false;
+    for ports in gesehen.values() {
+        if ports.len() < 2 {
+            continue;
+        }
+        entschieden = true;
+        if ports.iter().any(|p| *p != ports[0]) {
+            return Some(false); // pro Verbindung
+        }
+    }
+    if entschieden { Some(true) } else { None }
+}
+
+/// Eine einzelne Probe von einem bestimmten lokalen Port aus.
+async fn probe_once_from_port(
+    probe_addr: SocketAddr,
+    session_id: &str,
+    local_port: u16,
+    probe_num: u32,
+    filtertest: bool,
+) -> Result<Option<u16>> {
+    use crate::punch::{create_hole_punch_socket, bind_to_port};
+
+    // Frischer Socket auf demselben Port — der gebundene bleibt unangetastet.
+    // Moeglich, weil beide SO_REUSEADDR/SO_REUSEPORT gesetzt haben.
+    let sock = create_hole_punch_socket()?;
+    bind_to_port(&sock, local_port)?;
+    sock.set_nonblocking(true)?;
+
+    match sock.connect(&SockAddr::from(probe_addr)) {
+        Ok(()) => {}
+        Err(e) => {
+            #[cfg(unix)]
+            let in_progress = e.raw_os_error() == Some(libc::EINPROGRESS)
+                || e.kind() == std::io::ErrorKind::WouldBlock;
+            #[cfg(not(unix))]
+            let in_progress = e.kind() == std::io::ErrorKind::WouldBlock;
+            if !in_progress {
+                return Err(anyhow!("connect: {}", e));
+            }
+        }
+    }
+
+    let std_stream: std::net::TcpStream = sock.into();
+    let stream = TcpStream::from_std(std_stream)?;
+
+    tokio::time::timeout(Duration::from_secs(5), stream.writable())
+        .await
+        .map_err(|_| anyhow!("Timed out while connecting"))??;
+    stream.peer_addr().map_err(|e| anyhow!("not connected: {}", e))?;
+
+    let probe = if filtertest {
+        ProbeMessage::mit_filtertest(session_id, local_port, probe_num)
+    } else {
+        ProbeMessage::new(session_id, local_port, probe_num)
+    };
+    let msg = serde_json::to_string(&probe).unwrap_or_default() + "\n";
+    let (reader, mut writer) = stream.into_split();
+    tokio::io::AsyncWriteExt::write_all(&mut writer, msg.as_bytes()).await?;
+
+    // Die Bestaetigung enthaelt den Port, den der Server als Absender gesehen
+    // hat. Daraus laesst sich ablesen, ob die eigene NAT pro 5-Tupel oder pro
+    // Verbindung vergibt — und das entscheidet, ob eine Vorspannung ueberhaupt
+    // etwas bewirken kann.
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    // Beim Filtertest antwortet der Server erst nach seinem Rueckverbindungs-
+    // versuch, der bis zu zwei Sekunden dauern darf.
+    let wartezeit = if filtertest { Duration::from_secs(8) } else { Duration::from_secs(3) };
+    match tokio::time::timeout(wartezeit, reader.read_line(&mut line)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let seen = serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .and_then(|v| v.get("your_nat_port").and_then(|p| p.as_u64()))
+                .map(|p| p as u16);
+            Ok(seen)
+        }
+        _ => Ok(None),
+    }
+}
+
 pub async fn run_relay_protocol(
     server_addr: &str,
     session_id: &str,
@@ -123,6 +297,8 @@ pub async fn run_relay_protocol(
     min_connections: u32,
     extra_ports: Vec<u16>,
     bound_sockets: Vec<Socket>,
+    probe_from_bound: bool,
+    punch_ports: u32,
 ) -> Result<(TcpStream, Session)> {
     info!("Connecting to relay server: {}", server_addr);
     let server_sock_addr = resolve_socket_addr(server_addr)?;
@@ -155,6 +331,7 @@ pub async fn run_relay_protocol(
         Some(allow_fallback),
         Some(min_connections),
         extra_ports,
+        Some(punch_ports.max(1)),
     );
     let msg = serde_json::to_string(&register)? + "\n";
     writer.write_all(msg.as_bytes()).await?;
@@ -165,21 +342,14 @@ pub async fn run_relay_protocol(
     let register_sent_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
     
     let mut session = Session {
-        peer_public_addr: None,
-        peer_addresses: vec![],
-        peer_nat_analysis: None,
-        same_network: false,
         time_offset: 0.0,
-        our_public_port: None,
-        our_delta: 0,
-        port_preserved: true,
         tcp_connections,
         allow_fallback,
         min_connections,
         bound_sockets,
-        peer_extra_ports: vec![],
         server_addr: server_sock_addr,
         probe_port: None,
+        mapping_stable: None,
     };
     
     loop {
@@ -193,53 +363,72 @@ pub async fn run_relay_protocol(
             .map_err(|e| anyhow!("Failed to parse server message: {} - {}", e, line.trim()))?;
         
         match msg {
-            RelayMessage::Registered { your_public_addr, server_time, server_times, probe_port, needs_probing, .. } => {
+            RelayMessage::Registered { your_public_addr, server_time, probe_port, probe_port2, needs_probing, filter_test, .. } => {
                 if let Some((ip, port)) = RelayMessage::parse_addr(&your_public_addr) {
-                    session.our_public_port = Some(port);
-                    session.our_delta = port as i32 - local_port as i32;
-                    session.port_preserved = session.our_delta == 0;
-                    session.probe_port = probe_port;  // Store for later use
+                    session.probe_port = probe_port;
                     info!("Registered! Public address: {}:{}", ip, port);
                     
-                    if let Some(times) = server_times {
-                        // Collect offsets from all timestamp samples
-                        let mut offsets = Vec::new();
-                        for srv_time in times {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs_f64();
-                            let offset = srv_time - now;
-                            offsets.push(offset);
+                    // Uhrenversatz aus einem Zeitstempel plus halber
+                    // Umlaufzeit. Genauer muss es nicht sein: beide Seiten
+                    // halten ihre Sockets das ganze Zeitbudget offen, die
+                    // Fenster ueberlappen also um Sekunden.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64();
+                    match server_time {
+                        Some(srv_time) => {
+                            let rtt = now - register_sent_at;
+                            session.time_offset = srv_time - (register_sent_at + rtt / 2.0);
+                            info!("Clock offset {:.3}s (round trip {:.3}s)", session.time_offset, rtt);
                         }
-                        
-                        // Calculate median (robust against network jitter outliers)
-                        offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        session.time_offset = offsets[offsets.len() / 2];
-                        
-                        info!("Clock offset (median of {} samples): {:.3}s", offsets.len(), session.time_offset);
-                        info!("   Range: {:.3}s to {:.3}s (spread: {:.3}s)", 
-                              offsets.first().unwrap_or(&0.0),
-                              offsets.last().unwrap_or(&0.0),
-                              offsets.last().unwrap_or(&0.0) - offsets.first().unwrap_or(&0.0));
-                    } else if let Some(srv_time) = server_time {
-                        // Fallback to old RTT/2 method (for backward compatibility)
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs_f64();
-                        let rtt = now - register_sent_at;
-                        session.time_offset = srv_time - (register_sent_at + rtt / 2.0);
-                        warn!("Using legacy RTT/2 time sync (offset: {:.3}s) - server should send server_times array", session.time_offset);
-                    } else {
-                        warn!("No time sync data received from server - synchronization may be inaccurate");
-                        session.time_offset = 0.0;
+                        None => {
+                            warn!("No time sync data from server - synchronization may be inaccurate");
+                            session.time_offset = 0.0;
+                        }
                     }
-                    
+
+                    // Auch ohne Probing will der Server das Filterverhalten
+                    // bestimmen — dafuer genuegt eine einzige gehaltene
+                    // Verbindung vom spaeteren Punch-Port.
+                    if !needs_probing.unwrap_or(false) && filter_test.unwrap_or(false) {
+                        if let (Some(pp), Some(sock)) = (probe_port, session.bound_sockets.first()) {
+                            let probe_addr = SocketAddr::new(server_sock_addr.ip(), pp);
+                            let port = sock.local_addr().ok()
+                                .and_then(|a| a.as_socket()).map(|a| a.port()).unwrap_or(0);
+                            if port != 0 {
+                                match probe_once_from_port(probe_addr, session_id, port, 0, true).await {
+                                    Ok(_) => info!("Filter test of our own NAT requested"),
+                                    Err(e) => warn!("Filter test not possible: {}", e),
+                                }
+                            }
+                        }
+                    }
+
                     if needs_probing.unwrap_or(false) {
                         if let Some(pp) = probe_port {
                             let probe_addr = SocketAddr::new(server_sock_addr.ip(), pp);
-                            let _ = do_nat_probing(probe_addr, session_id, probe_count).await;
+                            let probe_addr2 = probe_port2
+                                .map(|p2| SocketAddr::new(server_sock_addr.ip(), p2));
+                            if probe_from_bound {
+                                match do_nat_probing_from_bound(
+                                    probe_addr, probe_addr2, session_id,
+                                    &session.bound_sockets, probe_count,
+                                ).await {
+                                    Ok(stable) => {
+                                        session.mapping_stable = stable;
+                                        match stable {
+                                            Some(true) => info!("Own NAT: mapping stable per five-tuple"),
+                                            Some(false) => info!("Own NAT: fresh port per connection"),
+                                            None => info!("Own NAT: mapping behaviour undetermined"),
+                                        }
+                                    }
+                                    Err(e) => warn!("NAT probing failed: {}", e),
+                                }
+                            } else {
+                                // Referenzverhalten: Ephemeralports.
+                                let _ = do_nat_probing(probe_addr, session_id, probe_count).await;
+                            }
                         }
                     }
                     

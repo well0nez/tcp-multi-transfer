@@ -1,0 +1,102 @@
+{
+  "expected": {
+    "delta_max": -37729,
+    "delta_median": -37874.0,
+    "delta_min": -37961,
+    "delta_stdev": 69.15779059513108,
+    "error_range": 283,
+    "local_ports": [
+      43031,
+      43031,
+      43031,
+      43031,
+      43031,
+      43031,
+      43031,
+      43031,
+      43031,
+      43031
+    ],
+    "max_port": 5302,
+    "min_port": 5070,
+    "needs_scan": true,
+    "pattern_type": "random_like",
+    "port_range": 232,
+    "port_rate": 25.108751979913464,
+    "predicted_port": 5182,
+    "predicted_shift": 25,
+    "prediction_delay": 2.0,
+    "prediction_source": "extrapoliert",
+    "probed_ports": [
+      5146,
+      5302,
+      5166,
+      5180,
+      5226,
+      5070,
+      5091,
+      5241,
+      5100,
+      5148
+    ],
+    "scan_end": 5302,
+    "scan_start": 5070
+  },
+  "input": {
+    "prediction_mode": "delta",
+    "prediction_range_extra_pct": 0.0,
+    "probes": [
+      {
+        "local_port": 43031,
+        "nat_port": 5146,
+        "ts": 1788145484.9894109
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5302,
+        "ts": 1788145486.1293993
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5166,
+        "ts": 1788145488.2367766
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5180,
+        "ts": 1788145490.4191692
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5226,
+        "ts": 1788145492.5839884
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5070,
+        "ts": 1788145494.7816224
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5091,
+        "ts": 1788145496.9342198
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5241,
+        "ts": 1788145498.0239751
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5100,
+        "ts": 1788145500.1492043
+      },
+      {
+        "local_port": 43031,
+        "nat_port": 5148,
+        "ts": 1788145502.3140473
+      }
+    ],
+    "target_local_port": 43031
+  }
+}

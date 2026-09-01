@@ -1,0 +1,102 @@
+{
+  "expected": {
+    "delta_max": -32218,
+    "delta_median": -32355.5,
+    "delta_min": -32442,
+    "delta_stdev": 62.756752624717606,
+    "error_range": 264,
+    "local_ports": [
+      37507,
+      37508,
+      37509,
+      37510,
+      37507,
+      37508,
+      37509,
+      37510,
+      37507,
+      37508
+    ],
+    "max_port": 5290,
+    "min_port": 5065,
+    "needs_scan": true,
+    "pattern_type": "random_like",
+    "port_range": 225,
+    "port_rate": 96.22358066787214,
+    "predicted_port": 5184,
+    "predicted_shift": 32,
+    "prediction_delay": 2.0,
+    "prediction_source": "extrapoliert",
+    "probed_ports": [
+      5065,
+      5150,
+      5160,
+      5244,
+      5146,
+      5115,
+      5100,
+      5157,
+      5189,
+      5290
+    ],
+    "scan_end": 5290,
+    "scan_start": 5065
+  },
+  "input": {
+    "prediction_mode": "delta",
+    "prediction_range_extra_pct": 0.0,
+    "probes": [
+      {
+        "local_port": 37507,
+        "nat_port": 5065,
+        "ts": 1788139550.8040438
+      },
+      {
+        "local_port": 37508,
+        "nat_port": 5150,
+        "ts": 1788139550.894027
+      },
+      {
+        "local_port": 37509,
+        "nat_port": 5160,
+        "ts": 1788139550.9939024
+      },
+      {
+        "local_port": 37510,
+        "nat_port": 5244,
+        "ts": 1788139551.0539055
+      },
+      {
+        "local_port": 37507,
+        "nat_port": 5146,
+        "ts": 1788139553.1988652
+      },
+      {
+        "local_port": 37508,
+        "nat_port": 5115,
+        "ts": 1788139553.2787628
+      },
+      {
+        "local_port": 37509,
+        "nat_port": 5100,
+        "ts": 1788139553.363468
+      },
+      {
+        "local_port": 37510,
+        "nat_port": 5157,
+        "ts": 1788139553.439213
+      },
+      {
+        "local_port": 37507,
+        "nat_port": 5189,
+        "ts": 1788139554.5364203
+      },
+      {
+        "local_port": 37508,
+        "nat_port": 5290,
+        "ts": 1788139554.6388626
+      }
+    ],
+    "target_local_port": 37507
+  }
+}

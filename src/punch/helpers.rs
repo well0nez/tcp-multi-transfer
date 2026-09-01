@@ -9,8 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 use anyhow::{Result, anyhow};
 
+
 const PRE_HANDSHAKE_MAGIC: [u8; 4] = *b"HPCH";
-const PRE_HANDSHAKE_VERSION: u8 = 1;
+/// Version 2 traegt zusaetzlich eine Zufallszahl je Socket.
+const PRE_HANDSHAKE_VERSION: u8 = 2;
 const PRE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Get current Unix timestamp
@@ -45,21 +47,44 @@ pub fn bind_to_port(socket: &Socket, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Pre-handshake protocol to verify both peers are ready
-pub async fn pre_handshake(stream: &mut TcpStream) -> Result<()> {
-    let mut out = [0u8; 5];
+/// Pre-Handshake: bestaetigt, dass am anderen Ende dieses Werkzeug sitzt, und
+/// tauscht eine Zufallszahl je Socket aus.
+///
+/// Die Zufallszahl loest ein Problem, das erst mit mehreren gleichzeitigen
+/// Verbindungen auftritt. Gelingt der Punch mehrfach, muessen **beide** Seiten
+/// dieselbe Verbindung behalten und die uebrigen fallenlassen. Die frueher
+/// dafuer benutzte Regel — das geordnete Paar aus lokalem und entferntem Port —
+/// ist hinter NAT keine gemeinsame Groesse: die eine Seite sieht ihren lokalen
+/// Port und den uebersetzten Port der Gegenstelle, die andere genau umgekehrt
+/// *andere* Zahlen. Beide Seiten waehlten dann verschiedene Verbindungen, und
+/// der Transfer brach mit "early eof" ab.
+///
+/// Die beiden Zufallszahlen dagegen gehoeren zur Verbindung selbst und sind auf
+/// beiden Seiten dieselben, nur vertauscht. Das geordnete Paar daraus ist
+/// symmetrisch.
+///
+/// Rueckgabe: das geordnete Paar (kleinere, groessere Zahl).
+pub async fn pre_handshake(stream: &mut TcpStream) -> Result<(u64, u64)> {
+    let eigen: u64 = rand::random();
+
+    let mut out = [0u8; 13];
     out[..4].copy_from_slice(&PRE_HANDSHAKE_MAGIC);
     out[4] = PRE_HANDSHAKE_VERSION;
+    out[5..].copy_from_slice(&eigen.to_be_bytes());
 
     tokio::time::timeout(PRE_HANDSHAKE_TIMEOUT, stream.write_all(&out)).await.map_err(|_| anyhow!("write timeout"))??;
 
-    let mut buf = [0u8; 5];
+    let mut buf = [0u8; 13];
     tokio::time::timeout(PRE_HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf)).await.map_err(|_| anyhow!("read timeout"))??;
 
     if buf[..4] != PRE_HANDSHAKE_MAGIC || buf[4] != PRE_HANDSHAKE_VERSION {
         return Err(anyhow!("Pre-handshake mismatch"));
     }
-    Ok(())
+    let mut fremd = [0u8; 8];
+    fremd.copy_from_slice(&buf[5..]);
+    let fremd = u64::from_be_bytes(fremd);
+
+    Ok(if eigen <= fremd { (eigen, fremd) } else { (fremd, eigen) })
 }
 
 

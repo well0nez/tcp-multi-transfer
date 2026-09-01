@@ -2,8 +2,7 @@ name: build
 
 on:
   push:
-    branches:
-      - main
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -36,6 +35,11 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build (release)
+        # Warnungsfrei ist der Stand, in dem das Repo ist — und der Zustand,
+        # in dem es bleiben soll. Eine neue Warnung ist billiger zu beheben,
+        # wenn sie sofort auffaellt.
+        env:
+          RUSTFLAGS: "-D warnings"
         run: cargo build --release
 
       - name: Prepare dist (unix)
@@ -60,3 +64,47 @@ jobs:
         with:
           name: tcp-multi-transfer-${{ runner.os }}
           path: dist
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-cargo-
+
+      # Analysator (mit den aufgezeichneten Fixtures) und die Koordination im
+      # Relay, die gegen einen echten Server auf 127.0.0.1 gefahren wird.
+      - name: Python tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Build (release)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --release
+
+      # Echte Transfers ueber Loopback: ein, zwei und vier Stroeme, ungleiches
+      # --chunk auf beiden Seiten, kleine Datei ueber viele Stroeme, winziges
+      # Grace-Fenster, abgelehnte Doppelregistrierung, Streckenmessung.
+      # Prueft das Zusammenspiel von Client und Relay, das kein Unit-Test
+      # erreicht.
+      - name: Loopback regression
+        run: ./regression.sh

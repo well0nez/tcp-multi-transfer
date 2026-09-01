@@ -29,17 +29,11 @@ const TCP_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 /// Progress tracker with atomic byte counter and periodic UI updates
 pub struct ProgressTracker {
     bar: ProgressBar,
-    position_bytes: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl ProgressTracker {
-    pub fn new(total_bytes: u64, filename: &str) -> Self {
-        let bytes = Arc::new(AtomicU64::new(0));
-        Self::with_bytes_and_speed(total_bytes, filename, bytes.clone(), bytes)
-    }
-
     pub fn with_bytes(total_bytes: u64, filename: &str, bytes: Arc<AtomicU64>) -> Self {
         Self::with_bytes_and_speed(total_bytes, filename, bytes.clone(), bytes)
     }
@@ -62,11 +56,8 @@ impl ProgressTracker {
             total_bytes,
         );
 
-        Self { bar, position_bytes, stop, task }
-    }
-
-    pub fn bytes(&self) -> Arc<AtomicU64> {
-        self.position_bytes.clone()
+        let _ = position_bytes;
+        Self { bar, stop, task }
     }
 
     pub fn set_position(&self, pos: u64) {
@@ -158,7 +149,7 @@ pub async fn calculate_sha256(file_path: &str) -> Result<([u8; 32], u64)> {
     Ok((hash, file_size))
 }
 
-async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+pub(crate) async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
     let mut file = File::open(path).await?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; super::get_chunk_size()];

@@ -26,6 +26,11 @@ pub struct RegisterMessage {
     pub min_connections: Option<u32>,
     #[serde(default)]
     pub extra_ports: Vec<u16>,
+    /// Wie viele lokale Ports beim Punchen gleichzeitig gehalten werden.
+    /// Der Relay braucht die Zahl, um daraus die noetige Abdeckung der
+    /// Gegenstelle auszurechnen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub punch_ports: Option<u32>,
 }
 
 impl RegisterMessage {
@@ -39,6 +44,7 @@ impl RegisterMessage {
         allow_fallback: Option<bool>,
         min_connections: Option<u32>,
         extra_ports: Vec<u16>,
+        punch_ports: Option<u32>,
     ) -> Self {
         Self {
             msg_type: "register".to_string(),
@@ -52,6 +58,7 @@ impl RegisterMessage {
             allow_fallback,
             min_connections,
             extra_ports,
+            punch_ports,
         }
     }
 }
@@ -129,6 +136,10 @@ pub struct ProbeMessage {
     pub session_id: String,
     pub local_port: u16,
     pub probe_num: u32,
+    /// Bittet den Server, das Filterverhalten zu pruefen, *solange diese
+    /// Verbindung offen ist*. Nur dann ist das Mapping nachweislich lebendig.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
 }
 
 impl ProbeMessage {
@@ -138,15 +149,26 @@ impl ProbeMessage {
             session_id: session_id.to_string(),
             local_port,
             probe_num,
+            hold: false,
         }
+    }
+
+    pub fn mit_filtertest(session_id: &str, local_port: u16, probe_num: u32) -> Self {
+        Self { hold: true, ..Self::new(session_id, local_port, probe_num) }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PeerAddressInfo {
-    #[allow(dead_code)]
     pub ip: String,
     pub port: u16,
+    /// "public", "predicted_range" oder "local". Aeltere Server senden das Feld
+    /// nicht — dann bleibt es leer und der Kandidat gilt als oeffentlich.
+    #[serde(default)]
+    pub addr_type: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub priority: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -162,8 +184,13 @@ pub struct NATAnalysis {
     #[allow(dead_code)]
     pub pattern_type: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub needs_scan: bool,
+    /// Tatsaechlich beobachtete Portgrenzen — enger als der Scanbereich, der
+    /// den Aufschlag aus der Ordnungsstatistik enthaelt.
+    #[serde(default)]
+    pub min_port: u16,
+    #[serde(default)]
+    pub max_port: u16,
     
     // Ignore all other fields sent by server (predicted_port, error_range, delta_median, etc.)
     // This keeps the data available if we change our mind later
@@ -184,12 +211,20 @@ pub enum RelayMessage {
         server_time: Option<f64>,
         #[serde(default)]
         probe_port: Option<u16>,
+        /// Zweiter Probe-Port auf derselben Adresse. Nur mit beiden laesst sich
+        /// sagen, ob das Mapping vom Ziel abhaengt (RFC 4787).
+        #[serde(default)]
+        probe_port2: Option<u16>,
         #[serde(default)]
         needs_probing: Option<bool>,
+        /// Der Server bietet den Filtertest auch ohne Portband-Analyse an.
         #[serde(default)]
-        server_times: Option<Vec<f64>>,
+        filter_test: Option<bool>,
     },
     
+    // Felder, die der Client (noch) nicht auswertet, bleiben stehen: sie
+    // dokumentieren die Drahtform und fangen sie beim Deserialisieren ab.
+    #[allow(dead_code)]
     #[serde(rename = "peer_info")]
     PeerInfo {
         peer_public_addr: Vec<serde_json::Value>,
@@ -199,6 +234,10 @@ pub enum RelayMessage {
         same_network: bool,
         #[serde(default)]
         peer_nat_analysis: Option<NATAnalysis>,
+        /// Die Analyse der *eigenen* NAT. Nur damit laesst sich entscheiden, ob
+        /// zusaetzliche lokale Ports Ziehungen sind oder Leerlauf.
+        #[serde(default)]
+        your_nat_analysis: Option<NATAnalysis>,
         #[serde(default)]
         tcp_connections: Option<u32>,
         #[serde(default)]
@@ -209,8 +248,6 @@ pub enum RelayMessage {
         peer_extra_ports: Vec<u16>,
         #[serde(default)]
         connection_num: Option<u32>,
-        #[serde(default)]
-        punch_strategy: Option<String>,  // "listen" | "connect" | "scan"
     },
     
     #[serde(rename = "peer_added_ports")]

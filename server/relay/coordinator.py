@@ -27,14 +27,12 @@ async def coordinate_multi_connections(
             logger.error(f"Session {session_id} not found")
             return
         
-        sender = session.get('sender')
-        receiver = session.get('receiver')
+        sender, receiver = session.beide()
         
         if not sender or not receiver:
             logger.error(f"Session {session_id}: Missing sender or receiver")
             return
         
-        session['coordination_active'] = True
         coordination_started = True
     try:
         logger.info(f"Session {session_id}: Starting multi-connection coordination ({tcp_connections} connections)")
@@ -49,9 +47,9 @@ async def coordinate_multi_connections(
                 # If both peers already reported a result, skip coordination.
                 async with lock:
                     session = session_manager.sessions.get(session_id)
-                    session_results = (session or {}).get('conn_results') or {}
-                    sender_result = session_results.get('sender', {}).get(conn_num) or sender.conn_results.get(conn_num)
-                    receiver_result = session_results.get('receiver', {}).get(conn_num) or receiver.conn_results.get(conn_num)
+                    ergebnisse = session.conn_results if session else {"sender": {}, "receiver": {}}
+                    sender_result = ergebnisse["sender"].get(conn_num) or sender.conn_results.get(conn_num)
+                    receiver_result = ergebnisse["receiver"].get(conn_num) or receiver.conn_results.get(conn_num)
                 if sender_result and receiver_result:
                     logger.info(
                         f"Session {session_id}: Connection {conn_num} already resolved "
@@ -87,14 +85,9 @@ async def coordinate_multi_connections(
                 receiver.conn_reasons.pop(conn_num, None)
                 session = session_manager.sessions.get(session_id)
                 if session:
-                    session_results = session.get('conn_results')
-                    if session_results:
-                        session_results.get('sender', {}).pop(conn_num, None)
-                        session_results.get('receiver', {}).pop(conn_num, None)
-                    session_reasons = session.get('conn_reasons')
-                    if session_reasons:
-                        session_reasons.get('sender', {}).pop(conn_num, None)
-                        session_reasons.get('receiver', {}).pop(conn_num, None)
+                    for rolle in ("sender", "receiver"):
+                        session.conn_results[rolle].pop(conn_num, None)
+                        session.conn_reasons[rolle].pop(conn_num, None)
             
             await send_peer_info_for_connection(
                 session_id,
@@ -164,11 +157,10 @@ async def coordinate_multi_connections(
             async with lock:
                 session = session_manager.sessions.get(session_id)
                 if session:
-                    session['coordination_active'] = False
-                    if not session.get('sender') and not session.get('receiver'):
+                    if session.sender is None and session.receiver is None:
                         session_manager.sessions.pop(session_id, None)
                         session_manager.pending_probes.pop(session_id, None)
-                        session_manager.peer_info_sent.pop(session_id, None)
+                        session_manager.session_locks.pop(session_id, None)
 
 
 async def coordinate_retry_connection(
@@ -188,8 +180,7 @@ async def coordinate_retry_connection(
             logger.error(f"Session {session_id} not found for retry connection {conn_num}")
             return
         
-        sender = session.get('sender')
-        receiver = session.get('receiver')
+        sender, receiver = session.beide()
         
         if not sender or not receiver:
             logger.error(f"Session {session_id}: Missing sender or receiver for retry connection {conn_num}")
@@ -257,13 +248,12 @@ async def wait_for_connection_result(
                 logger.error(f"Session {session_id} not found while waiting for conn {conn_num} result")
                 return None
             
-            sender = session.get('sender')
-            receiver = session.get('receiver')
-            session_results = session.setdefault('conn_results', {'sender': {}, 'receiver': {}})
-            session_reasons = session.setdefault('conn_reasons', {'sender': {}, 'receiver': {}})
+            sender, receiver = session.beide()
+            session_results = session.conn_results
+            session_reasons = session.conn_reasons
 
-            sender_result = session_results.get('sender', {}).get(conn_num)
-            receiver_result = session_results.get('receiver', {}).get(conn_num)
+            sender_result = session_results['sender'].get(conn_num)
+            receiver_result = session_results['receiver'].get(conn_num)
 
             if sender and not sender_result:
                 live = sender.conn_results.get(conn_num)
@@ -336,17 +326,35 @@ async def send_peer_info_for_connection(
                 f"Sender local={sender_port} nat={sender_nat_port}, "
                 f"Receiver local={receiver_port} nat={receiver_nat_port}")
     
-    sender_strategy = determine_punch_strategy(sender, receiver)
-    receiver_strategy = determine_punch_strategy(receiver, sender)
-    
+    # Gleiche oeffentliche Adresse => beide hinter derselben NAT. Dann sind die
+    # privaten Adressen die zuverlaessigste Verbindung: viele Consumer-Router
+    # koennen kein Hairpinning, ueber die oeffentliche Adresse kommen die beiden
+    # dann gar nicht zueinander. Ein Subnetzvergleich findet bewusst nicht statt
+    # — die LAN-Adresse wird nur zusaetzlich angeboten, der normale Punch laeuft
+    # unveraendert weiter, ein Fehlgriff kostet also nichts.
+    same_network = bool(
+        sender.public_addr and receiver.public_addr
+        and sender.public_addr[0] == receiver.public_addr[0]
+    )
+    sender_lan = (sender.private_ip, sender_port) if same_network else None
+    receiver_lan = (receiver.private_ip, receiver_port) if same_network else None
+
+    if same_network:
+        logger.info(
+            f"Session {session_id}: connection {conn_num} - both peers behind "
+            f"{sender.public_addr[0]}, LAN candidates {sender_lan} / {receiver_lan}"
+        )
+
     sender_addrs = get_peer_addresses_with_prediction(
-        sender, receiver, max_scan_ports,
-        base_port=sender_nat_port
+        sender, max_scan_ports,
+        base_port=sender_nat_port,
+        lan_addr=sender_lan,
     )
     
     receiver_addrs = get_peer_addresses_with_prediction(
-        receiver, sender, max_scan_ports,
-        base_port=receiver_nat_port
+        receiver, max_scan_ports,
+        base_port=receiver_nat_port,
+        lan_addr=receiver_lan,
     )
     
     logger.debug(f"Connection {conn_num}: sender_addrs={len(sender_addrs)} addresses (primary={sender_nat_port}), "
@@ -359,9 +367,13 @@ async def send_peer_info_for_connection(
         'peer_local_port': receiver_port,
         'peer_addresses': receiver_addrs,
         'your_role': 'sender',
-        'same_network': False,
+        'same_network': same_network,
         'peer_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None,
-        'punch_strategy': sender_strategy,
+        # Die eigene Analyse gehoert auch auf die Gegenseite: der Client kann
+        # nur mit ihr entscheiden, ob zusaetzliche lokale Ports ueberhaupt
+        # etwas bringen. Bei vorhersagbarer Vergabe kennt der Peer genau einen
+        # Port von uns, jedes weitere Mapping laege ausserhalb seiner Liste.
+        'your_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None,
         'tcp_connections': sender.tcp_connections,
     }
     await send_message(sender.writer, msg_to_sender)
@@ -373,15 +385,15 @@ async def send_peer_info_for_connection(
         'peer_local_port': sender_port,
         'peer_addresses': sender_addrs,
         'your_role': 'receiver',
-        'same_network': False,
+        'same_network': same_network,
         'peer_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None,
-        'punch_strategy': receiver_strategy,
+        'your_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None,
         'tcp_connections': sender.tcp_connections,
     }
     await send_message(receiver.writer, msg_to_receiver)
     
     logger.info(f"Session {session_id}: peer_info sent for connection {conn_num} "
-                f"(sender={sender_strategy}, receiver={receiver_strategy})")
+                f"(same_network={same_network})")
 
 
 def get_nat_port_for_local_port(peer, local_port: int) -> int:
@@ -397,6 +409,18 @@ def get_nat_port_for_local_port(peer, local_port: int) -> int:
             logger.debug(f"Port-Preserved NAT: predicting NAT port {local_port} for local port {local_port}")
             return local_port
         
+        # Bei zufaelliger Vergabe im Band hat die Delta-Extrapolation keine
+        # Grundlage — `als_band` hat sie aus genau dem Grund schon durch den
+        # Median ersetzt. Hier noch einmal zu extrapolieren widerspraeche der
+        # eigenen Analyse.
+        if analysis.allocation == "zufaellig_im_band" and analysis.predicted_port:
+            predicted = max(1024, min(65535, int(round(analysis.predicted_port))))
+            logger.debug(
+                f"Random-band NAT: using {predicted} as the primary candidate "
+                f"for local port {local_port}"
+            )
+            return predicted
+
         # External mode: NAT port is independent of local port.
         if getattr(peer, "prediction_mode", "delta") == "external" and analysis.predicted_port:
             predicted = max(1024, min(65535, int(round(analysis.predicted_port))))
@@ -425,14 +449,3 @@ def get_nat_port_for_local_port(peer, local_port: int) -> int:
     return peer.public_addr[1]
 
 
-def determine_punch_strategy(my_peer, other_peer) -> str:
-    """
-    Determine punch strategy for TCP hole punching.
-    
-    Always returns "scan" (Simultaneous Open: Listener + Connect parallel).
-    All NAT types require Simultaneous Open to create holes in both NATs.
-    
-    Port-Preserved NAT: peer_addresses contains 1 address (predictable).
-    Complex NAT (CGNAT): peer_addresses contains 100-500 addresses (port range).
-    """
-    return "scan"

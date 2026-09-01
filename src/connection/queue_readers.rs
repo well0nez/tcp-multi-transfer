@@ -12,7 +12,7 @@ pub async fn wait_for_peer_info_from_queue(
     queues: &MessageQueues,
     conn_num: u32,
     timeout: Duration,
-) -> Result<(PeerInfo, String, u32)> {
+) -> Result<(PeerInfo, u32)> {
     let start = std::time::Instant::now();
     
     loop {
@@ -24,9 +24,9 @@ pub async fn wait_for_peer_info_from_queue(
             return Err(anyhow!("Server error: {}", error));
         }
         
-        if let Some((info, strategy, tcp_conns)) = queues.pop_peer_info(conn_num) {
+        if let Some((info, tcp_conns)) = queues.pop_peer_info(conn_num) {
             debug!("Got PeerInfo for conn {} from queue", conn_num);
-            return Ok((info, strategy, tcp_conns));
+            return Ok((info, tcp_conns));
         }
         
         tokio::time::sleep(Duration::from_millis(13)).await;
@@ -113,13 +113,11 @@ pub async fn wait_for_retry_granted_from_queue(
             return Err(anyhow!("Retry rejected: {}", reason));
         }
         
-        if let Some(granted_conn) = queues.pop_retry_granted(conn_num) {
-            if granted_conn == conn_num {
-                debug!("Got RetryGranted for conn {} from queue", conn_num);
-                return Ok(());
-            } else {
-                tracing::warn!("Got RetryGranted for wrong conn: {} (expected {})", granted_conn, conn_num);
-            }
+        // `pop_retry_granted` filtert bereits nach Verbindungsnummer; ein
+        // Treffer gehoert also immer uns.
+        if queues.pop_retry_granted(conn_num).is_some() {
+            debug!("Got RetryGranted for conn {} from queue", conn_num);
+            return Ok(());
         }
         
         tokio::time::sleep(Duration::from_millis(10)).await;

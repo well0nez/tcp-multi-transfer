@@ -1,0 +1,102 @@
+{
+  "expected": {
+    "delta_max": -34090,
+    "delta_median": -34137.0,
+    "delta_min": -34288,
+    "delta_stdev": 73.59592380016709,
+    "error_range": 298,
+    "local_ports": [
+      39389,
+      39389,
+      39389,
+      39389,
+      39389,
+      39389,
+      39389,
+      39389,
+      39389,
+      39389
+    ],
+    "max_port": 5299,
+    "min_port": 5101,
+    "needs_scan": true,
+    "pattern_type": "random_like",
+    "port_range": 198,
+    "port_rate": 24.009011517488027,
+    "predicted_port": 5276,
+    "predicted_shift": 24,
+    "prediction_delay": 2.0,
+    "prediction_source": "extrapoliert",
+    "probed_ports": [
+      5274,
+      5287,
+      5187,
+      5299,
+      5121,
+      5136,
+      5299,
+      5101,
+      5244,
+      5260
+    ],
+    "scan_end": 5299,
+    "scan_start": 5101
+  },
+  "input": {
+    "prediction_mode": "delta",
+    "prediction_range_extra_pct": 0.0,
+    "probes": [
+      {
+        "local_port": 39389,
+        "nat_port": 5274,
+        "ts": 1788139685.8187678
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5287,
+        "ts": 1788139689.0039191
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5187,
+        "ts": 1788139690.0962968
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5299,
+        "ts": 1788139692.1990802
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5121,
+        "ts": 1788139694.3190093
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5136,
+        "ts": 1788139696.4914148
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5299,
+        "ts": 1788139698.6614795
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5101,
+        "ts": 1788139700.7762392
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5244,
+        "ts": 1788139702.9489152
+      },
+      {
+        "local_port": 39389,
+        "nat_port": 5260,
+        "ts": 1788139705.0615425
+      }
+    ],
+    "target_local_port": 39389
+  }
+}

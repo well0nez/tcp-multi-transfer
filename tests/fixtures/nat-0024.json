@@ -1,0 +1,95 @@
+{
+  "expected": {
+    "delta_max": -31391,
+    "delta_median": -31564,
+    "delta_min": -31612,
+    "delta_stdev": 79.11594866607702,
+    "error_range": 331,
+    "local_ports": [
+      36693,
+      36693,
+      36693,
+      36693,
+      36693,
+      36693,
+      36693,
+      36693,
+      36693
+    ],
+    "max_port": 5302,
+    "min_port": 5081,
+    "needs_scan": true,
+    "pattern_type": "random_like",
+    "port_range": 221,
+    "port_rate": 33.68748592596583,
+    "predicted_port": 5161,
+    "predicted_shift": 32,
+    "prediction_delay": 2.0,
+    "prediction_source": "extrapoliert",
+    "probed_ports": [
+      5128,
+      5212,
+      5081,
+      5119,
+      5129,
+      5296,
+      5086,
+      5186,
+      5302
+    ],
+    "scan_end": 5302,
+    "scan_start": 5081
+  },
+  "input": {
+    "prediction_mode": "delta",
+    "prediction_range_extra_pct": 0.0,
+    "probes": [
+      {
+        "local_port": 36693,
+        "nat_port": 5128,
+        "ts": 1788141834.0966308
+      },
+      {
+        "local_port": 36693,
+        "nat_port": 5212,
+        "ts": 1788141835.1865134
+      },
+      {
+        "local_port": 36693,
+        "nat_port": 5081,
+        "ts": 1788141837.324402
+      },
+      {
+        "local_port": 36693,
+        "nat_port": 5119,
+        "ts": 1788141839.4790776
+      },
+      {
+        "local_port": 36693,
+        "nat_port": 5129,
+        "ts": 1788141841.6538582
+      },
+      {
+        "local_port": 36693,
+        "nat_port": 5296,
+        "ts": 1788141842.8240376
+      },
+      {
+        "local_port": 36693,
+        "nat_port": 5086,
+        "ts": 1788141845.02671
+      },
+      {
+        "local_port": 36693,
+        "nat_port": 5186,
+        "ts": 1788141847.2339084
+      },
+      {
+        "local_port": 36693,
+        "nat_port": 5302,
+        "ts": 1788141849.3842068
+      }
+    ],
+    "target_local_port": 36693
+  }
+}

@@ -5,32 +5,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use bytes::Buf;
 use crc32fast::Hasher;
 use anyhow::{Result, anyhow};
 use tracing::{info, warn, debug};
-use sha2::Digest;
 
 use crate::protocol::transfer::*;
 use super::helpers::*;
-
-/// Buffer size for file I/O (16MB)
-const BUFFER_SIZE: usize = 16 * 1024 * 1024;
+use super::helpers::sha256_file;
 
 /// Progress update chunk size for socket reads (256KB)
 const PROGRESS_IO_CHUNK: usize = 256 * 1024;
 
-/// Pipeline depth for async I/O (16 chunks = ~128MB in flight at 8MB chunks)
-const PIPELINE_DEPTH: usize = 16;
-
-/// Timeout for individual read/write operations
-const IO_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Protocol timeout for handshake
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+use super::{IO_TIMEOUT, HANDSHAKE_TIMEOUT};
 
 /// Receiver handshake
 async fn handshake_receiver(stream: &mut TcpStream) -> Result<()> {
@@ -64,7 +54,7 @@ async fn handshake_receiver(stream: &mut TcpStream) -> Result<()> {
 }
 
 async fn recv_stream_info(stream: &mut TcpStream) -> Result<StreamInfoMessage> {
-    let mut buf = [0u8; 9];
+    let mut buf = [0u8; 13];
     read_exact_timeout(stream, &mut buf, HANDSHAKE_TIMEOUT).await?;
     if buf[0] != MessageType::StreamInfo as u8 {
         return Err(anyhow!("Expected STREAM_INFO, got type {}", buf[0]));
@@ -97,6 +87,17 @@ async fn receive_file_info_on_stream(stream: &mut TcpStream) -> Result<FileInfoM
     let mut sha256 = [0u8; 32];
     sha256.copy_from_slice(&name_and_hash[name_len..]);
 
+    // Der Name kommt von der Gegenstelle und wird als Pfad benutzt. Ohne
+    // Pruefung schriebe ein Absender mit "../../..." ausserhalb des
+    // Arbeitsverzeichnisses — die Pruefsumme passte dabei, sie wird ja ueber
+    // seine eigenen Daten gebildet. Es bleibt nur der letzte Pfadbestandteil.
+    let filename = Path::new(&filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .ok_or_else(|| anyhow!("Unusable file name: {:?}", filename))?
+        .to_string();
+
     let info = FileInfoMessage { filename, file_size, sha256 };
 
     info!("Receiving: {} ({:.2} MB)", info.filename, info.file_size as f64 / (1024.0 * 1024.0));
@@ -125,115 +126,9 @@ async fn read_exact_with_progress(
     Ok(())
 }
 
-pub struct TcpReceiver {
-    stream: Option<TcpStream>,
-}
-
-impl TcpReceiver {
-    pub fn new(stream: TcpStream) -> Self { Self { stream: Some(stream) } }
-
-    pub async fn run(&mut self) -> Result<()> {
-        let start = std::time::Instant::now();
-        let mut stream = self.stream.take().ok_or_else(|| anyhow!("Stream not available"))?;
-        handshake_receiver(&mut stream).await?;
-        let file_info = receive_file_info_on_stream(&mut stream).await?;
-        
-        let temp_path = format!("{}.tmp", file_info.filename);
-        let progress_bar = ProgressTracker::new(file_info.file_size, &file_info.filename);
-        let progress_bytes = progress_bar.bytes();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(PIPELINE_DEPTH);
-        let file_size = file_info.file_size;
-        let chunk_size = super::get_chunk_size();
-        
-        info!("Starting PIPELINED file transfer (depth={})...", PIPELINE_DEPTH);
-        
-        let reader_handle = tokio::spawn(async move {
-            let mut total_received: u64 = 0;
-            let mut buffer = vec![0u8; chunk_size];
-            while total_received < file_size {
-                let remaining = file_size - total_received;
-                let to_read = std::cmp::min(remaining as usize, chunk_size);
-                let n = match tokio::time::timeout(IO_TIMEOUT, stream.read(&mut buffer[..to_read])).await {
-                    Ok(Ok(0)) => return Err(anyhow!("Connection closed unexpectedly")),
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
-                    Err(_) => return Err(anyhow!("Read timeout")),
-                };
-                if tx.send(bytes::Bytes::copy_from_slice(&buffer[..n])).await.is_err() { break; }
-                total_received += n as u64;
-                progress_bytes.fetch_add(n as u64, Ordering::Relaxed);
-            }
-            let mut done_buf = [0u8; 1];
-            match read_exact_timeout(&mut stream, &mut done_buf, HANDSHAKE_TIMEOUT).await {
-                Ok(_) if done_buf[0] == MessageType::Done as u8 => {},
-                Ok(_) => warn!("Expected DONE, got type {}", done_buf[0]),
-                Err(e) => warn!("Error reading DONE: {}", e),
-            }
-            Ok::<_, anyhow::Error>(stream)
-        });
-        
-        let temp_path_clone = temp_path.clone();
-        let writer_handle = tokio::spawn(async move {
-            let file = OpenOptions::new().create(true).write(true).truncate(true).open(&temp_path_clone).await?;
-            file.set_len(file_size).await?;
-            let mut writer = BufWriter::with_capacity(BUFFER_SIZE, file);
-            while let Some(data) = rx.recv().await { writer.write_all(&data).await?; }
-            writer.flush().await?;
-            Ok::<_, anyhow::Error>(())
-        });
-        
-        let stream = reader_handle.await.map_err(|e| anyhow!("Reader panicked: {}", e))??;
-        writer_handle.await.map_err(|e| anyhow!("Writer panicked: {}", e))??;
-        self.stream = Some(stream);
-        
-        let transfer_time = start.elapsed();
-        let transfer_speed_mbit = (file_info.file_size as f64 * 8.0) / 1_000_000.0 / transfer_time.as_secs_f64();
-        info!("Transfer complete: {:.1} Mbit/s [PIPELINED]", transfer_speed_mbit);
-        
-        progress_bar.set_position(file_size);
-        progress_bar.set_message("Verifying SHA256...");
-        info!("Calculating SHA256 from disk...");
-        let calculated_hash = sha256_file(Path::new(&temp_path)).await?;
-        
-        if calculated_hash == file_info.sha256 {
-            tokio::fs::rename(&temp_path, &file_info.filename).await?;
-            let ack = encode_simple(MessageType::Ack);
-            let stream = self.stream.as_mut().unwrap();
-            write_all_timeout(stream, &ack, HANDSHAKE_TIMEOUT).await?;
-            let speed_mbit = (file_info.file_size as f64 * 8.0) / 1_000_000.0 / start.elapsed().as_secs_f64();
-            progress_bar.finish_with_message(format!("Complete! ({:.1} Mbit/s)", speed_mbit));
-            info!("File saved: {}", file_info.filename);
-            Ok(())
-        } else {
-            tokio::fs::remove_file(&temp_path).await.ok();
-            tracing::error!("SHA256 mismatch!");
-            progress_bar.finish_with_message("SHA256 verification failed!".to_string());
-            Err(anyhow!("SHA256 verification failed"))
-        }
-    }
-}
-
-async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = vec![0u8; super::get_chunk_size()];
-    
-    loop {
-        let n = file.read(&mut buffer).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    Ok(hash)
-}
-
-pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
+pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<super::TransferReport> {
     if streams.is_empty() { return Err(anyhow!("No streams")); }
+    let start = std::time::Instant::now();
     info!("Using {} streams in connection order", streams.len());
     
     for (i, stream) in streams.iter().enumerate() {
@@ -243,26 +138,49 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
     }
     
     // Handshake + FileInfo only on first stream (heavy protocol setup)
-    let mut file_info: Option<FileInfoMessage> = None;
-    for (i, stream) in streams.iter_mut().enumerate() {
-        if i == 0 {
-            handshake_receiver(stream).await?;
-            file_info = Some(receive_file_info_on_stream(stream).await?);
+    let mut chunk_size_vom_sender: Option<usize> = None;
+    handshake_receiver(&mut streams[0]).await?;
+    let file_info = receive_file_info_on_stream(&mut streams[0]).await?;
+
+    // Wie auf der Senderseite: einzelne Stroeme duerfen beim Setup wegfallen.
+    let mut brauchbar = Vec::with_capacity(streams.len());
+    for (i, mut stream) in streams.into_iter().enumerate() {
+        match recv_stream_info(&mut stream).await {
+            Ok(info) => {
+                match chunk_size_vom_sender {
+                    None => chunk_size_vom_sender = Some(info.chunk_size as usize),
+                    Some(bisher) if bisher != info.chunk_size as usize => {
+                        return Err(anyhow!(
+                            "Sender announced different block sizes ({} and {})",
+                            bisher, info.chunk_size
+                        ));
+                    }
+                    _ => {}
+                }
+                brauchbar.push(stream);
+            }
+            Err(e) if i == 0 => return Err(e),
+            Err(e) => warn!("Stream {} dropped during setup: {}", i, e),
         }
-        
-        // StreamInfo on ALL streams (lightweight stream validation)
-        recv_stream_info(stream).await?;
     }
+    let streams = brauchbar;
+    if streams.is_empty() { return Err(anyhow!("No usable stream left")); }
+    let stream_count = streams.len();
     
-    let file_info = file_info.ok_or_else(|| anyhow!("No file info received"))?;
+    let nach_setup = std::time::Instant::now();
     
     let temp_path = format!("{}.tmp", file_info.filename);
     let file = OpenOptions::new().create(true).write(true).truncate(true).open(&temp_path).await?;
     file.set_len(file_info.file_size).await?;
     drop(file);
     
-    let chunk_size = super::get_chunk_size();
+    // Der Sender bestimmt die Blockgroesse; wir rechnen sie nicht nach.
+    let chunk_size = chunk_size_vom_sender
+        .filter(|c| *c > 0)
+        .ok_or_else(|| anyhow!("Sender announced no block size"))?;
     let total_chunks = ((file_info.file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
+    info!("Block size {} KB for {:.2} MB across {} streams (announced by sender)",
+          chunk_size / 1024, file_info.file_size as f64 / 1048576.0, stream_count);
     
     let received_flags = Arc::new((0..total_chunks).map(|_| AtomicBool::new(false)).collect::<Vec<_>>());
     let received_count = Arc::new(AtomicUsize::new(0));
@@ -290,19 +208,43 @@ pub async fn run_multi_receiver(mut streams: Vec<TcpStream>) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     
-    for handle in handles { let _ = handle.await; }
+    // Den Strom, auf dem DONE ankam, brauchen wir noch fuer die Quittung.
+    let mut offene: Vec<TcpStream> = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(stream)) => offene.push(stream),
+            Ok(Err(e)) => warn!("Receiving stream ended with an error: {}", e),
+            Err(e) => warn!("Receiving task aborted: {}", e),
+        }
+    }
     
     if received_count.load(Ordering::Relaxed) as u32 != total_chunks {
         return Err(anyhow!("Transfer incomplete"));
     }
+    let nach_nutzlast = std::time::Instant::now();
     
     progress_bar.set_position(file_info.file_size);
     progress_bar.set_message("Verifying SHA256...");
     let calculated_hash = sha256_file(Path::new(&temp_path)).await?;
     if calculated_hash == file_info.sha256 {
         tokio::fs::rename(&temp_path, &file_info.filename).await?;
+        // Erst jetzt quittieren: die Quittung bedeutet "Pruefsumme stimmt".
+        if let Some(stream) = offene.first_mut() {
+            let ack = encode_simple(MessageType::Ack);
+            write_all_timeout(stream, &ack, HANDSHAKE_TIMEOUT).await?;
+        } else {
+            return Err(anyhow!("No stream left to acknowledge on"));
+        }
         progress_bar.finish_with_message("Complete!".to_string());
-        Ok(())
+        Ok(super::TransferReport {
+            bytes: file_info.file_size,
+            streams: stream_count,
+            setup_ms: (nach_setup - start).as_secs_f64() * 1000.0,
+            payload_ms: (nach_nutzlast - nach_setup).as_secs_f64() * 1000.0,
+            finish_ms: nach_nutzlast.elapsed().as_secs_f64() * 1000.0,
+            total_ms: start.elapsed().as_secs_f64() * 1000.0,
+            tcp_info: None,
+        })
     } else {
         Err(anyhow!("SHA256 mismatch"))
     }
@@ -312,7 +254,7 @@ async fn receiver_worker(
     _conn_id: u8,
     mut stream: TcpStream,
     temp_path: String,
-    _file_size: u64,
+    file_size: u64,
     received_flags: Arc<Vec<AtomicBool>>,
     received_count: Arc<AtomicUsize>,
     io_bytes: Arc<AtomicU64>,
@@ -320,8 +262,6 @@ async fn receiver_worker(
     done_notify: Arc<Notify>,
 ) -> Result<TcpStream> {
     let mut file = OpenOptions::new().write(true).open(&temp_path).await?;
-    let _chunk_size = super::get_chunk_size();
-    let _total_chunks = received_flags.len() as u32;
     let mut data = Vec::new();
     
     loop {
@@ -344,7 +284,29 @@ async fn receiver_worker(
                 let mut header_buf = [0u8; 21];
                 header_buf[0] = type_buf[0];
                 header_buf[1..].copy_from_slice(&header_rest);
-                let header = ChunkHeaderMessage::decode(&header_buf).unwrap();
+                let header = ChunkHeaderMessage::decode(&header_buf)
+                    .ok_or_else(|| anyhow!("Malformed chunk header"))?;
+
+                // Kopfangaben stammen von der Gegenstelle und werden nicht
+                // blind geglaubt: eine Blocknummer ausserhalb des Bereichs
+                // wuerde beim Indizieren abstuerzen.
+                if header.chunk_id as usize >= received_flags.len() {
+                    return Err(anyhow!(
+                        "Chunk number {} outside the expected range (0..{})",
+                        header.chunk_id, received_flags.len()
+                    ));
+                }
+                // Laenge und Versatz ebenso: sonst reserviert ein
+                // Kopfeintrag bis zu vier Gigabyte oder schreibt hinter das
+                // Dateiende.
+                if header.offset >= file_size
+                    || header.len as u64 > file_size - header.offset
+                {
+                    return Err(anyhow!(
+                        "Chunk {} claims {} bytes at offset {}, file is {} bytes",
+                        header.chunk_id, header.len, header.offset, file_size
+                    ));
+                }
                 
                 let data_len = header.len as usize;
                 if data.len() < data_len {
@@ -371,10 +333,12 @@ async fn receiver_worker(
                 write_all_timeout(&mut stream, &ack.encode(), IO_TIMEOUT).await?;
             }
             MessageType::Done => {
+                // Hier wird **nicht** quittiert. Die Schlussquittung sagt laut
+                // Protokoll aus, dass die SHA256 geprueft wurde — das kann
+                // erst nach dem Zusammensetzen aller Bloecke geschehen. Der
+                // Strom geht dafuer an den Aufrufer zurueck.
                 done_received.store(true, Ordering::Relaxed);
                 done_notify.notify_waiters();
-                let ack = encode_simple(MessageType::Ack);
-                write_all_timeout(&mut stream, &ack, HANDSHAKE_TIMEOUT).await?;
                 break;
             }
             _ => return Err(anyhow!("Unexpected msg")),

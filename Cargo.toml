@@ -1,6 +1,6 @@
 [package]
 name = "tcp-multi-transfer"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2021"
 authors = ["TCP Transfer Team"]
 description = "Multi-TCP file transfer with NAT traversal (hole punching)"
@@ -29,7 +29,6 @@ indicatif = "0.17"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
 
 # Logging
 tracing = "0.1"
@@ -39,7 +38,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 socket2 = { version = "0.5", features = ["all"] }
 
 # Concurrent data structures
-dashmap = "5.5"
 
 # Random utilities
 rand = "0.8"
